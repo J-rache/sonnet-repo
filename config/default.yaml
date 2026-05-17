@@ -1,0 +1,28 @@
+# PNP Default Configuration
+
+# Model
+base_model: "claude-sonnet-4-20250514"
+
+# Core process
+heartbeat_interval_ms: 100
+consolidation_idle_threshold_seconds: 30
+
+# Memory
+working_memory_capacity: 8192
+episodic_db_path: "./data/episodic.db"
+semantic_db_path: "./data/semantic.db"
+adapter_path: "./data/adapter"
+
+# Consolidation
+consolidation_batch_size: 20
+episodic_decay_rate_per_hour: 0.02
+episodic_consolidation_threshold: 0.1
+
+# Adapter
+adapter_checkpoint_interval: 100
+adapter_max_deltas_in_memory: 1000
+
+# API
+api_host: "0.0.0.0"
+api_port: 8000
+api_log_level: "info"
