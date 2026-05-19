@@ -13,6 +13,8 @@ def config(tmp_path):
         "semantic_db_path": str(tmp_path / "sem.db"),
         "embed_path": str(tmp_path / "embed.pkl"),
         "adapter_path": str(tmp_path / "adapter"),
+        "core_state_path": str(tmp_path / "core_state.json"),
+        "journal_path": str(tmp_path / "events.jsonl"),
         "working_memory_capacity": 4096,
         "consolidation_idle_threshold_seconds": 1,  # Fast for tests
     }

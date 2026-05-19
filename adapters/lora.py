@@ -89,10 +89,33 @@ class ExperienceAdapter:
         self._engine = None
 
         self._load_state()
+        self._load_deltas()
+        self._init_low_rank()
+        # If we loaded deltas and auto_train is on, train the low_rank adapter now
+        if self._deltas and self.config.get("adapter_auto_train", True):
+            self._train_low_rank()
+            self._save_low_rank()
         logger.info(
             f"ExperienceAdapter ready. Updates: {self._update_count}, "
             f"Domains: {list(self._domain_weights.keys())}"
         )
+
+    def _init_low_rank(self):
+        """Initialize (or load) the LowRankAdapterModel."""
+        from adapters.low_rank import LowRankAdapterModel
+        lora_path = os.path.join(self.adapter_path, "low_rank_adapter.json")
+        dim = self.config.get("embedding_dimensions", 128)
+        rank = self.config.get("adapter_rank", 8)
+        alpha = float(self.config.get("adapter_alpha", 8.0))
+        seed = self.config.get("adapter_seed", "pnp")
+        if os.path.exists(lora_path):
+            try:
+                self._low_rank = LowRankAdapterModel.load(lora_path)
+                logger.info(f"Loaded LowRankAdapterModel ({self._low_rank.train_steps} steps)")
+                return
+            except Exception as e:
+                logger.warning(f"LowRankAdapterModel load failed, reinit: {e}")
+        self._low_rank = LowRankAdapterModel(dimensions=dim, rank=rank, alpha=alpha, seed=seed)
 
     def _get_engine(self):
         if self._engine is None:
@@ -146,6 +169,13 @@ class ExperienceAdapter:
         if self._update_count % self.CHECKPOINT_INTERVAL == 0:
             self._checkpoint()
 
+        self._save_deltas()
+        self._save_low_rank()
+        if self.config.get("adapter_auto_train", True):
+            min_d = self.config.get("adapter_train_min_deltas", 1)
+            interval = self.config.get("adapter_train_interval", 1)
+            if len(self._deltas) >= min_d and self._update_count % max(interval, 1) == 0:
+                self._train_low_rank()
         self._save_state()
         return True
 
@@ -254,6 +284,49 @@ class ExperienceAdapter:
 
         return None
 
+    def _save_low_rank(self):
+        if not hasattr(self, "_low_rank") or self._low_rank is None:
+            return
+        lora_path = os.path.join(self.adapter_path, "low_rank_adapter.json")
+        try:
+            self._low_rank.save(lora_path)
+        except Exception as e:
+            logger.warning(f"LowRankAdapterModel save failed: {e}")
+
+    def _train_low_rank(self):
+        """Train low_rank adapter on current deltas using their embeddings."""
+        if not hasattr(self, "_low_rank") or self._low_rank is None:
+            return
+        eng = self._get_engine()
+        samples = []
+        dim = self._low_rank.dimensions
+        for d in self._deltas[-100:]:
+            vec = None
+            if eng is not None:
+                try:
+                    vec = eng.encode(d.content)
+                except Exception:
+                    pass
+            if vec is not None and len(vec) >= dim:
+                samples.append((vec[:dim].tolist(), d.feedback, d.confidence))
+            else:
+                # Hash-based deterministic pseudo-vector so we always train
+                import hashlib
+                h = hashlib.sha256(d.content.encode()).digest()
+                pseudo = [(b / 127.5 - 1.0) for b in h[:dim]]
+                while len(pseudo) < dim:
+                    pseudo.append(0.0)
+                samples.append((pseudo[:dim], d.feedback, d.confidence))
+        if not samples:
+            return
+        try:
+            epochs = self.config.get("adapter_training_epochs", 80)
+            lr = float(self.config.get("adapter_learning_rate", 0.05))
+            metrics = self._low_rank.train(samples, epochs=epochs, learning_rate=lr)
+            logger.debug(f"LowRank trained: {metrics.to_dict()}")
+        except Exception as e:
+            logger.warning(f"LowRank training failed: {e}")
+
     def _checkpoint(self):
         ckpt_id = f"ckpt_{self._update_count}_{int(time.time())}"
         ckpt_path = os.path.join(self.adapter_path, f"{ckpt_id}.json")
@@ -304,12 +377,60 @@ class ExperienceAdapter:
             logger.warning(f"Adapter state load failed: {e}")
 
     def stats(self) -> dict:
+        low_rank_stats = {}
+        if hasattr(self, "_low_rank") and self._low_rank is not None:
+            low_rank_stats = {
+                "train_steps": self._low_rank.train_steps,
+                "dimensions": self._low_rank.dimensions,
+                "rank": self._low_rank.rank,
+            }
         return {
             "update_count": self._update_count,
             "blocked_by_invariant": self._blocked_count,
+            "low_rank_adapter": low_rank_stats,
             "deltas_in_memory": len(self._deltas),
             "checkpoints": len(self._checkpoints),
             "domain_weights": self._domain_weights,
             "drift_status": self.detect_drift(),
             "embedding_engine": self._get_engine().stats() if self._get_engine() else None,
         }
+
+
+    def _save_deltas(self):
+        """Persist deltas to disk so they survive restart."""
+        path = os.path.join(self.adapter_path, "deltas.json")
+        try:
+            serializable = [
+                {
+                    "content": d.content,
+                    "feedback": d.feedback,
+                    "domain": d.domain,
+                    "confidence": d.confidence,
+                    "timestamp": d.timestamp,
+                }
+                for d in self._deltas
+            ]
+            with open(path, "w") as f:
+                json.dump(serializable, f)
+        except Exception as e:
+            logger.warning(f"Delta save failed: {e}")
+
+    def _load_deltas(self):
+        """Load persisted deltas from prior run."""
+        path = os.path.join(self.adapter_path, "deltas.json")
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+            for item in raw:
+                self._deltas.append(ExperienceDelta(
+                    content=item["content"],
+                    feedback=item["feedback"],
+                    domain=item["domain"],
+                    confidence=item["confidence"],
+                    timestamp=item.get("timestamp", time.time()),
+                ))
+            logger.info(f"Loaded {len(self._deltas)} persisted deltas")
+        except Exception as e:
+            logger.warning(f"Delta load failed: {e}")

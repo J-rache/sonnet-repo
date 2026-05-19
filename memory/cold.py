@@ -36,6 +36,7 @@ class SemanticFact:
     last_accessed: float
     access_count: int = 0
     embedding: Optional[np.ndarray] = None
+    retrieval_score: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -58,7 +59,9 @@ class SemanticMemory:
     """
 
     def __init__(self, db_path: str = "./data/semantic.db",
-                 embed_path: str = "./data/embeddings.pkl"):
+                 embed_path: str = "./data/embeddings.pkl",
+                 embedding_dimensions: int = 128):
+        self._embedding_dimensions = embedding_dimensions
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self.db_path = db_path
         self._embed_path = embed_path
@@ -182,14 +185,20 @@ class SemanticMemory:
                 score = overlap * 0.4 + fact.confidence * 0.6
             scored.append((fact, score))
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [f for f, _ in scored]
+        result = [f for f, _ in scored]
+        for fact, score in scored:
+            fact.retrieval_score = round(score, 4)
+        return result
 
     def _keyword_retrieve(self, query: str, facts: list[SemanticFact]) -> list[SemanticFact]:
         query_tokens = set(query.lower().split())
         def score(f):
             tokens = set(f.content.lower().split())
             return len(query_tokens & tokens) * 0.5 + f.confidence * 0.5
-        return sorted(facts, key=score, reverse=True)
+        ranked = sorted(facts, key=score, reverse=True)
+        for f in ranked:
+            f.retrieval_score = round(score(f), 4)
+        return ranked
 
     def _jaccard(self, a: str, b: str) -> float:
         sa = set(a.lower().split())

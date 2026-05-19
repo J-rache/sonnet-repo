@@ -328,3 +328,28 @@ def compute_valence(text: str) -> float:
     if total == 0:
         return 0.0
     return round((pos - neg) / total, 3)
+
+
+# ── Compatibility aliases for inference/providers.py ──────────────────────────
+# providers.py uses these names from the original scaffold.
+
+def build_full_context(request: "InferenceRequest") -> list[dict]:
+    """Alias for build_messages — compatibility with providers.py."""
+    return build_messages(request)
+
+
+def estimate_valence(text: str) -> float:
+    """Alias for compute_valence — compatibility with providers.py."""
+    return compute_valence(text)
+
+
+def extract_memory_deltas_sync(user_input: str, response: str) -> list[dict]:
+    """
+    Synchronous heuristic-only delta extraction for providers.py.
+    (providers.py calls this synchronously; the async version uses the LLM.)
+    """
+    return _heuristic_deltas(user_input, response)
+
+
+# providers.py imports extract_memory_deltas — point it at the sync version
+extract_memory_deltas = extract_memory_deltas_sync  # type: ignore[assignment]

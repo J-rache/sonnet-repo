@@ -23,6 +23,7 @@ from core.goals import GoalStack, GoalPriority
 from memory.hot import WorkingMemory
 from memory.warm import EpisodicMemory
 from memory.consolidator import Consolidator
+from core.journal import EventJournal
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,9 @@ class PersistentCore:
         self.consolidator = Consolidator(self.episodic_memory, config)
 
         self.salience: dict[str, float] = {}
+        self.replay_summary: dict = {}
+        journal_path = config.get("journal_path", "./data/events.jsonl")
+        self.journal = EventJournal(journal_path)
         self._restore_state()
         logger.info(f"PersistentCore initialized. Uptime start: {datetime.now(timezone.utc).isoformat()}Z")
 
@@ -162,7 +166,9 @@ class PersistentCore:
         self.working_memory.boost_salience(content, boost=0.2)
         self.working_memory.add(content, metadata)
         self.state.on_novel_input()
-
+        self.journal.append("interaction_received", {"role": metadata.get("role", "user"),
+                                                      "concepts": concepts,
+                                                      "content_preview": content[:80]})
         return self.get_state_snapshot()
 
     def on_inference_result(self, suggested_goals: list[dict], valence: float):
@@ -181,6 +187,8 @@ class PersistentCore:
         # Positive valence interactions boost curiosity
         if valence > 0.3:
             self.state.curiosity = min(1.0, self.state.curiosity + 0.05)
+        self.journal.append("memory_written", {"valence": valence,
+                                                "new_goals": len(suggested_goals)})
 
     def get_state_snapshot(self) -> dict:
         return {
@@ -197,26 +205,99 @@ class PersistentCore:
             "working_memory_tokens": self.working_memory.current_tokens,
         }
 
+    def add_goal(self, description: str, priority=None, deadline=None):
+        """Convenience method: add goal and journal it."""
+        from core.goals import GoalPriority
+        if priority is None:
+            priority = GoalPriority.MEDIUM
+        goal = self.goals.add(description=description, priority=priority, deadline=deadline)
+        self.journal.append("goal_added", {"goal_id": goal.id, "description": description,
+                                            "priority": priority.name})
+        return goal
+
+    async def run_consolidation_cycle(self):
+        """Expose consolidation as a directly callable coroutine (for tests and API)."""
+        result = await self.consolidator.run_cycle(self.salience)
+        self.metrics.consolidation_cycles += 1
+        self.journal.append("consolidation_ran", result)
+        return result
+
     async def _save_state(self):
         os.makedirs("./data", exist_ok=True)
         state = self.get_state_snapshot()
-        with open("./data/core_state.json", "w") as f:
+        state_path = self.config.get("core_state_path", "./data/core_state.json")
+        state["journal_sequence"] = self.journal.last_sequence
+        with open(state_path, "w") as f:
             json.dump(state, f, indent=2, default=str)
-        logger.info("Core state saved to ./data/core_state.json")
+        logger.info(f"Core state saved. Journal sequence: {self.journal.last_sequence}")
 
     def _restore_state(self):
-        """Restore metrics from previous run if available."""
-        path = "./data/core_state.json"
-        if not os.path.exists(path):
-            return
+        """Restore metrics from snapshot, then replay journal events after snapshot."""
+        state_path = self.config.get("core_state_path", "./data/core_state.json")
+        snapshot_sequence = 0
+        restored = False
+
+        if os.path.exists(state_path):
+            try:
+                with open(state_path) as f:
+                    prev = json.load(f)
+                self.metrics.total_interactions = prev.get("total_interactions", 0)
+                self.metrics.consolidation_cycles = prev.get("consolidation_cycles", 0)
+                snapshot_sequence = prev.get("journal_sequence", 0)
+                # Restore salience map
+                for k, v in prev.get("salience_map", {}).items():
+                    self.salience[k] = v
+                # Restore goals
+                for g in prev.get("active_goals", []):
+                    from core.goals import GoalPriority
+                    try:
+                        pri = GoalPriority[g.get("priority", "MEDIUM")]
+                    except KeyError:
+                        pri = GoalPriority.MEDIUM
+                    new_goal = self.goals.add(description=g["description"], priority=pri)
+                    # Restore original goal ID
+                    orig_id = g.get("id")
+                    if orig_id and orig_id != new_goal.id:
+                        self.goals._goals[orig_id] = self.goals._goals.pop(new_goal.id)
+                        self.goals._goals[orig_id].id = orig_id
+                restored = True
+                logger.info(f"Restored snapshot: {self.metrics.total_interactions} interactions")
+            except Exception as e:
+                logger.warning(f"State restore failed: {e}")
+
+        # Replay journal events that happened after the snapshot
+        events_replayed = 0
         try:
-            with open(path) as f:
-                prev = json.load(f)
-            self.metrics.total_interactions = prev.get("total_interactions", 0)
-            self.metrics.consolidation_cycles = prev.get("consolidation_cycles", 0)
-            logger.info(
-                f"Restored prior state: {self.metrics.total_interactions} interactions, "
-                f"{self.metrics.consolidation_cycles} consolidation cycles"
-            )
+            events = self.journal.read(after_sequence=snapshot_sequence)
+            for event in events:
+                if event.type == "goal_added":
+                    from core.goals import GoalPriority
+                    desc = event.payload.get("description", "")
+                    pri_str = event.payload.get("priority", "MEDIUM")
+                    try:
+                        pri = GoalPriority[pri_str]
+                    except KeyError:
+                        pri = GoalPriority.MEDIUM
+                    goal_id = event.payload.get("goal_id")
+                    # Only add if not already restored from snapshot
+                    existing = [g for g in self.goals._goals.values() if g.description == desc]
+                    if not existing:
+                        g = self.goals.add(description=desc, priority=pri)
+                        if goal_id:
+                            # Restore the exact goal ID so references remain valid
+                            old_id = g.id
+                            self.goals._goals[goal_id] = self.goals._goals.pop(old_id)
+                            self.goals._goals[goal_id].id = goal_id
+                elif event.type == "interaction_received":
+                    concepts = event.payload.get("concepts", [])
+                    for c in concepts:
+                        self.salience[c] = min(1.0, self.salience.get(c, 0) + 0.15)
+                events_replayed += 1
         except Exception as e:
-            logger.warning(f"State restore failed: {e}")
+            logger.warning(f"Journal replay failed: {e}")
+
+        self.replay_summary = {
+            "restored_from_snapshot": restored,
+            "snapshot_sequence": snapshot_sequence,
+            "events_replayed": events_replayed,
+        }

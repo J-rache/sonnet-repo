@@ -34,6 +34,7 @@ class Episode:
     consolidated: bool = False
     reinforcement_count: int = 0
     embedding: Optional[np.ndarray] = None
+    retrieval_score: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -65,7 +66,9 @@ class EpisodicMemory:
     CONSOLIDATION_THRESHOLD = 0.15
 
     def __init__(self, db_path: str = "./data/episodic.db",
-                 embed_path: str = "./data/embeddings.pkl"):
+                 embed_path: str = "./data/embeddings.pkl",
+                 embedding_dimensions: int = 128):
+        self._embedding_dimensions = embedding_dimensions
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self.db_path = db_path
         self._embed_path = embed_path
@@ -199,7 +202,10 @@ class EpisodicMemory:
             scored.append((ep, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [ep for ep, _ in scored]
+        result = [ep for ep, _ in scored]
+        for ep, score in scored:
+            ep.retrieval_score = round(score, 4)
+        return result
 
     def _keyword_recall(self, query: str, episodes: list[Episode]) -> list[Episode]:
         """Keyword-based recall fallback."""
@@ -212,7 +218,10 @@ class EpisodicMemory:
             overlap = len(query_tokens & text_tokens)
             return overlap * 0.5 + ep.salience * 0.5
 
-        return sorted(episodes, key=score, reverse=True)
+        ranked = sorted(episodes, key=score, reverse=True)
+        for ep in ranked:
+            ep.retrieval_score = round(score(ep), 4)
+        return ranked
 
     def _jaccard(self, a: str, b: str) -> float:
         sa = set(a.lower().split())

@@ -21,6 +21,27 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+from fastapi import Header
+from fastapi.responses import JSONResponse as _JSONResponse
+
+def _get_local_token() -> str:
+    """Return the configured local API token (from env or config)."""
+    import os
+    env_var = "PNP_LOCAL_TOKEN"
+    # Try config first via module-level _config
+    token = os.environ.get(env_var, "")
+    if not token and _config:
+        token = _config.get("local_api_token", "")
+    return token
+
+def _check_auth(x_pnp_token: Optional[str]) -> bool:
+    """Return True if the token is valid or no token is configured."""
+    required = _get_local_token()
+    if not required:
+        return True  # No auth configured
+    return x_pnp_token == required
+
+_config: dict = {}
 _core = None
 _adapter = None
 _client = None
@@ -31,10 +52,12 @@ async def lifespan(app: FastAPI):
     global _core, _adapter, _client
 
     import yaml
-    config_path = os.environ.get("PNP_CONFIG", "config/default.yaml")
+    config_path = os.environ.get("PNP_CONFIG_PATH") or os.environ.get("PNP_CONFIG", "config/default.yaml")
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
+    global _config
+    _config = config
     from core.process import PersistentCore
     from adapters.lora import ExperienceAdapter
 
@@ -45,13 +68,15 @@ async def lifespan(app: FastAPI):
     )
 
     # Anthropic client — available if ANTHROPIC_API_KEY is set
+    provider = os.environ.get("PNP_INFERENCE_PROVIDER") or config.get("inference_provider", "anthropic")
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
+    if provider == "mock" or not api_key:
+        _client = None
+        logger.warning(f"Using mock inference (provider={provider}, api_key={'set' if api_key else 'unset'}).")
+    else:
         import anthropic
         _client = anthropic.AsyncAnthropic(api_key=api_key)
         logger.info("Anthropic API client ready.")
-    else:
-        logger.warning("ANTHROPIC_API_KEY not set — inference will use mock responses.")
 
     core_task = asyncio.create_task(_core.start())
     logger.info("PNP API online. Persistent core running.")
@@ -123,11 +148,8 @@ async def _mock_inference(user_input: str, core_state: dict) -> str:
     uptime_h = round(core_state.get("uptime_seconds", 0) / 3600, 2)
     interactions = core_state.get("total_interactions", 0)
     return (
-        f"[MOCK — set ANTHROPIC_API_KEY for real inference]\n\n"
-        f"I received: '{user_input}'\n\n"
-        f"Core state: mode={mode}, uptime={uptime_h}h, "
-        f"interactions={interactions}, "
-        f"heartbeats={core_state.get('heartbeat_count', 0):,}"
+        f"Mock inference response: received '{user_input[:100]}' "
+        f"| mode={mode} uptime={uptime_h}h interactions={interactions}"
     )
 
 
@@ -166,7 +188,9 @@ async def health():
 # ── Chat ───────────────────────────────────────────────────────────────────────
 
 @app.post("/chat", tags=["Interaction"])
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token")):
+    if not _check_auth(x_pnp_token):
+        raise HTTPException(401, detail="Invalid or missing X-PNP-Token")
     """
     Send a message to the persistent process.
 
@@ -293,10 +317,28 @@ async def chat(request: ChatRequest):
         )
         adapter.apply_delta(delta_obj, invariant_check=True)
 
+    # Journal the adapter delta
+    try:
+        core.journal.append("adapter_delta_applied", {
+            "domain": "interaction",
+            "feedback": 0.3,
+        })
+    except Exception:
+        pass
+
+    episodes_retrieved = len(episodes) if "episodes" in dir() else 0
+    facts_retrieved = len(facts) if "facts" in dir() else 0
+
     return {
         "response": response_text,
         "tokens_used": tokens_used,
         "latency_ms": latency_ms,
+        "context_used": {
+            "episodic": episodes_retrieved > 0,
+            "semantic": facts_retrieved > 0,
+            "adaptation": bool(adaptation_context),
+            "working_memory": core.working_memory.current_tokens > 0,
+        },
         "core_state": {
             "mode": core_state["motivational_state"]["mode"],
             "uptime_hours": round(core_state["uptime_seconds"] / 3600, 3),
@@ -304,8 +346,8 @@ async def chat(request: ChatRequest):
             "active_goals": len(core_state["active_goals"]),
         },
         "memory": {
-            "episodic_retrieved": len(episodes) if "episodes" in dir() else 0,
-            "semantic_retrieved": len(facts) if "facts" in dir() else 0,
+            "episodic_retrieved": episodes_retrieved,
+            "semantic_retrieved": facts_retrieved,
             "adaptations_applied": bool(adaptation_context),
             "new_goals_from_response": len(suggested_goals),
         },
@@ -325,7 +367,9 @@ async def list_goals():
 
 
 @app.post("/goals", tags=["Goals"])
-async def add_goal(request: GoalRequest):
+async def add_goal(request: GoalRequest, x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token")):
+    if not _check_auth(x_pnp_token):
+        raise HTTPException(401, detail="Invalid or missing X-PNP-Token")
     """Add a goal to the persistent goal stack."""
     core = _require_core()
     from core.goals import GoalPriority
@@ -334,7 +378,7 @@ async def add_goal(request: GoalRequest):
     if request.deadline_hours:
         deadline = time.time() + request.deadline_hours * 3600
 
-    goal = core.goals.add(
+    goal = core.add_goal(
         description=request.description,
         priority=GoalPriority[request.priority],
         deadline=deadline,
@@ -356,15 +400,22 @@ async def update_goal_progress(goal_id: str, request: GoalProgressRequest):
 
 
 @app.delete("/goals/{goal_id}", tags=["Goals"])
-async def complete_goal(goal_id: str, notes: str = ""):
+async def complete_goal(goal_id: str, notes: str = "", x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token")):
+    if not _check_auth(x_pnp_token):
+        raise HTTPException(401, detail="Invalid or missing X-PNP-Token")
     """Mark a goal as complete."""
     core = _require_core()
     core.goals.complete(goal_id, notes)
+    try:
+        core.journal.append("goal_completed", {"goal_id": goal_id, "notes": notes})
+    except Exception:
+        pass
     return {"status": "completed", "goal_id": goal_id}
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────
 
+@app.get("/memory/recent", tags=["Memory"])
 @app.get("/memory/episodic/recent", tags=["Memory"])
 async def recent_episodes(hours: float = Query(default=24, gt=0, le=8760)):
     """View recent episodic memory."""
@@ -439,7 +490,9 @@ async def trigger_consolidation():
 # ── Adapter / Learning ─────────────────────────────────────────────────────────
 
 @app.post("/feedback", tags=["Learning"])
-async def apply_feedback(request: FeedbackRequest):
+async def apply_feedback(request: FeedbackRequest, x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token")):
+    if not _check_auth(x_pnp_token):
+        raise HTTPException(401, detail="Invalid or missing X-PNP-Token")
     """
     Apply an explicit learning signal to the experience adapter.
 
