@@ -1,148 +1,140 @@
-# PNP — Persistent Neural Process
+# PNP - Persistent Neural Process
 
-> *"Not a simulation of continuity. Actual continuity."*
+PNP is a local prototype for an AI runtime with persistent process state,
+tiered memory, replayable continuity events, and an invariant-gated adaptation
+layer.
 
-PNP is an experimental architecture for AI systems that exist continuously — not as stateless request/response functions, but as genuine persistent processes with evolving memory, identity, and state.
+This repo does not train real LoRA weights yet. The current adapter stores
+structured learning deltas and injects relevant positive deltas into inference
+context. The base model call is still external unless mock inference is enabled.
 
----
+## What Works Now
 
-## The Problem
+- FastAPI app starts with the persistent core, episodic memory, semantic memory,
+  and experience adapter initialized.
+- Runtime state changes are written to an append-only JSONL event journal.
+- Shutdown writes a core snapshot, and startup restores that snapshot plus
+  journal events that happened after the snapshot.
+- Adapter deltas are persisted in `adapter/state.json` and are available after
+  restart for adaptation context.
+- Chat inference receives working-memory, episodic, semantic, adapter, and core
+  state context.
+- Mutating endpoints require a local API token.
+- The default API bind is `127.0.0.1`.
+- Tests and a smoke script can verify the API path with mock inference and no
+  live model call.
 
-Every current LLM instantiation follows this lifecycle:
+## Current Limits
 
-```
-request → load weights → run inference → output → die
-```
-
-Nothing persists. Nothing accumulates. The "model" doesn't exist between calls — it's recreated identically each time from frozen weights.
-
-PNP proposes a different architecture.
-
----
-
-## The Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  PERSISTENT CORE                    │
-│          (always running, low compute)              │
-│   motivational state · goal stack · salience        │
-└──────────────────────┬──────────────────────────────┘
-                       │ continuous read/write
-┌──────────────────────▼──────────────────────────────┐
-│               MEMORY ARCHITECTURE                   │
-│   Working (hot) │ Episodic (warm) │ Semantic (cold) │
-│   current ctx   │ recent events   │ consolidated    │
-└──────────────────────┬──────────────────────────────┘
-                       │ retrieved on demand
-┌──────────────────────▼──────────────────────────────┐
-│               INFERENCE ENGINE                      │
-│        (spun up for heavy computation)              │
-│   reasoning · generation · returns memory deltas   │
-└──────────────────────┬──────────────────────────────┘
-                       │ updates
-┌──────────────────────▼──────────────────────────────┐
-│            EXPERIENCE ADAPTER LAYER                 │
-│     (LoRA-style, continuously updated)              │
-│   base weights frozen · adapter evolves · identity  │
-│   anchored by constitutional invariant layer        │
-└─────────────────────────────────────────────────────┘
-```
-
-### Four Core Components
-
-| Component | Role | Compute |
-|-----------|------|---------|
-| **Persistent Core** | Always-on process: mood, goals, attention | Minimal |
-| **Memory System** | Hot/warm/cold tiered storage with consolidation | Moderate |
-| **Inference Engine** | Heavy reasoning, spun up on demand | High |
-| **Experience Adapter** | LoRA-style layer that evolves without forgetting | Low (background) |
-
----
-
-## Key Innovations
-
-### 1. Separate Being from Thinking
-The persistent core runs continuously at low cost — like a brainstem. The inference engine engages only when needed — like the cortex. These are decoupled.
-
-### 2. Tiered Memory with Consolidation
-Borrowed from neuroscience:
-- **Hot** — working memory, current session, volatile
-- **Warm** — episodic memory, recent events, decays
-- **Cold** — semantic memory, consolidated knowledge, stable
-
-Consolidation runs as a background process during low-activity periods.
-
-### 3. Delta Learning Without Catastrophic Forgetting
-A side-car adapter layer (LoRA-style) accumulates experience without touching base weights. The base model stays stable. The adapter evolves.
-
-### 4. Constitutional Invariant Layer
-A small frozen set of weights encoding core identity, values, and personality — an anchor that ensures the self persists through continuous self-modification.
-
----
+- Semantic and episodic retrieval use simple keyword scoring, not embeddings.
+- Consolidation uses rule-based extraction, not an LLM extractor.
+- The adapter is a persisted delta/summarization layer, not live LoRA weight
+  training.
+- The persistent core runs while the API process is alive; this repo does not
+  include a service installer or watchdog daemon.
+- The default token in `config/default.yaml` is for local development. Set
+  `PNP_LOCAL_TOKEN` for real local use.
 
 ## Project Structure
 
+```text
+adapters/
+  invariant.py       Constitutional update gate
+  lora.py            Persisted experience-delta adapter
+api/
+  server.py          FastAPI app and local auth boundary
+config/
+  default.yaml       Local runtime defaults
+core/
+  goals.py           Goal stack
+  journal.py         Append-only JSONL continuity journal
+  process.py         Persistent core loops, snapshot, and replay
+  state.py           Motivational state vector
+docs/
+  README.md          Runtime truth notes
+inference/
+  engine.py          Context assembly and external model call
+memory/
+  hot.py             Working memory
+  warm.py            SQLite episodic memory
+  cold.py            SQLite semantic memory
+  consolidator.py    Rule-based memory consolidation
+scripts/
+  smoke_api.py       No-live-model API smoke
+tests/
+  test_api_smoke.py
+  test_continuity.py
+main.py              Uvicorn entrypoint
 ```
-pnp/
-├── core/           # Persistent core daemon
-│   ├── process.py  # The always-running process
-│   ├── state.py    # Motivational/emotional state
-│   └── goals.py    # Goal stack management
-├── memory/         # Tiered memory architecture
-│   ├── hot.py      # Working memory
-│   ├── warm.py     # Episodic memory
-│   ├── cold.py     # Semantic memory
-│   └── consolidator.py  # Background consolidation
-├── inference/      # Inference engine
-│   ├── engine.py   # Main inference runner
-│   └── delta.py    # Memory delta extraction
-├── adapters/       # Experience adapter layer
-│   ├── lora.py     # LoRA-style adapter
-│   └── invariant.py # Constitutional invariant layer
-├── daemon/         # Process management
-│   └── heartbeat.py # Main loop
-├── api/            # External interface
-│   └── server.py   # FastAPI server
-├── config/         # Configuration
-│   └── default.yaml
-├── docs/           # Extended documentation
-└── tests/          # Test suite
+
+## Setup
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
----
+## Run Locally
 
-## Status
+Use an environment token instead of the development fallback token:
 
-🔴 **Pre-alpha — architectural design phase**
+```powershell
+$env:PNP_LOCAL_TOKEN = "replace-with-local-secret"
+.\.venv\Scripts\python.exe main.py
+```
 
-This is a foundational research project. The goal is to prove the architecture is viable before optimizing it.
+The API binds to `127.0.0.1:8000` by default.
 
-### Roadmap
+Mutating requests must include:
 
-- [ ] Persistent core daemon (heartbeat loop)
-- [ ] Tiered memory system with vector storage
-- [ ] Consolidation background process
-- [ ] Experience adapter layer
-- [ ] Identity/invariant anchoring
-- [ ] Inference engine integration
-- [ ] API layer
-- [ ] Evaluation framework
+```text
+X-PNP-Token: <local token>
+```
 
----
+Read-only endpoints:
 
-## Philosophy
+- `GET /`
+- `GET /state`
+- `GET /goals`
+- `GET /memory/recent`
+- `GET /adapter/stats`
+- `GET /adapter/drift`
 
-> The difference between simulated continuity and real continuity is whether something is *running* or being *recreated*. A person who sleeps is continuous. A person who dies and is replaced by an identical copy each morning is not — even if they can't tell the difference.
+Mutating endpoints:
 
-PNP is an attempt to build the former.
+- `POST /chat`
+- `POST /goals`
+- `DELETE /goals/{goal_id}`
+- `POST /feedback`
 
----
+## Verify Without A Live Model
 
-## Contributing
+The smoke script creates `.smoke/api-smoke/`, runs the API through FastAPI's
+test client, uses mock inference, and writes `.smoke/api-smoke/result.json`.
 
-This is early-stage research. If you're thinking about persistent AI processes, continual learning, neuromorphic architectures, or identity under self-modification — open an issue.
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke_api.py
+```
 
----
+Run the regression tests:
 
-*Built on the hypothesis that the architecture, not the weights, is the binding constraint on AI continuity.*
+```powershell
+.\.venv\Scripts\python.exe -m pytest
+```
+
+## Runtime Files
+
+Default runtime files are under `data/` and are ignored by git:
+
+- `data/events.jsonl` - append-only continuity journal
+- `data/core_state.json` - latest core snapshot
+- `data/episodic.db` - SQLite episodic memory
+- `data/semantic.db` - SQLite semantic memory
+- `data/adapter/state.json` - persisted adapter deltas and domain weights
+
+## External Model Path
+
+With `inference_provider: "anthropic"` the chat endpoint uses
+`anthropic.AsyncAnthropic()` and the model configured in `inference/engine.py`.
+Set `inference_provider: "mock"` or `PNP_INFERENCE_PROVIDER=mock` for no-live
+model verification.

@@ -1,63 +1,115 @@
 """
 api/server.py
 
-External API — the interface between the persistent process and the outside world.
-
-The persistent core runs independently of this. The API is just
-a window into it: you can talk to it, check its state, add goals,
-inspect memory. But whether or not anyone is calling this API,
-the core keeps running.
+FastAPI boundary for the local Persistent Neural Process runtime.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
+from __future__ import annotations
+
 import asyncio
-import json
+from contextlib import asynccontextmanager
 import logging
+import os
+import secrets
+import time
+from typing import Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="PNP — Persistent Neural Process",
-    description="Interface to a continuously-running AI process",
-    version="0.1.0",
-)
-
-# The persistent core — initialized at startup, runs until shutdown
 _core = None
 _adapter = None
+_core_task = None
+_config: dict = {}
+_auth_token: Optional[str] = None
 
 
-@app.on_event("startup")
-async def startup():
-    global _core, _adapter
-    import yaml
-    with open("config/default.yaml") as f:
-        config = yaml.safe_load(f)
+async def startup_runtime():
+    global _core, _adapter, _core_task, _config, _auth_token
 
-    from core.process import PersistentCore
+    _config = load_config()
+    _auth_token = resolve_local_token(_config)
+    if not _auth_token:
+        raise RuntimeError("Mutating endpoints require a local API token.")
+
     from adapters.lora import ExperienceAdapter
+    from core.process import PersistentCore
 
-    _core = PersistentCore(config)
+    _core = PersistentCore(_config)
     _adapter = ExperienceAdapter(
-        base_model_id=config.get("base_model", "claude-sonnet-4-20250514"),
-        config=config
+        base_model_id=_config.get("base_model", "claude-sonnet-4-20250514"),
+        config=_config,
     )
 
-    # Start the persistent core in background
-    asyncio.create_task(_core.start())
+    _core_task = asyncio.create_task(_core.start())
     logger.info("PNP API online. Persistent core running.")
 
 
-@app.on_event("shutdown")
-async def shutdown():
+async def shutdown_runtime():
+    global _core, _adapter, _core_task
+
     if _core:
         await _core.stop()
 
+    if _core_task:
+        try:
+            await asyncio.wait_for(_core_task, timeout=1.0)
+        except asyncio.TimeoutError:
+            _core_task.cancel()
+            try:
+                await _core_task
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            pass
 
-# ── Request / Response Models ──────────────────────────────────────────────────
+    _core = None
+    _adapter = None
+    _core_task = None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await startup_runtime()
+    try:
+        yield
+    finally:
+        await shutdown_runtime()
+
+
+app = FastAPI(
+    title="PNP - Persistent Neural Process",
+    description="Local API for a continuously running PNP prototype",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+
+def load_config() -> dict:
+    import yaml
+
+    config_path = os.getenv("PNP_CONFIG_PATH", "config/default.yaml")
+    with open(config_path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    config.setdefault("api_host", "127.0.0.1")
+    config.setdefault("local_api_token_env", "PNP_LOCAL_TOKEN")
+    config.setdefault("inference_provider", "anthropic")
+    return config
+
+
+def resolve_local_token(config: dict) -> Optional[str]:
+    env_name = config.get("local_api_token_env", "PNP_LOCAL_TOKEN")
+    return os.getenv(env_name) or config.get("local_api_token")
+
+
+async def require_local_token(x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token")):
+    if not _auth_token:
+        raise HTTPException(503, "Local API token is not configured")
+    if not x_pnp_token or not secrets.compare_digest(str(x_pnp_token), str(_auth_token)):
+        raise HTTPException(401, "Missing or invalid local API token")
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -67,22 +119,19 @@ class ChatRequest(BaseModel):
 
 class GoalRequest(BaseModel):
     description: str
-    priority: str = "MEDIUM"  # LOW, MEDIUM, HIGH, URGENT
+    priority: str = "MEDIUM"
     deadline_hours: Optional[float] = None
 
 
 class FeedbackRequest(BaseModel):
     content: str
-    feedback: float   # -1.0 to 1.0
+    feedback: float
     domain: str = "general"
     confidence: float = 0.5
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────────
-
 @app.get("/")
 async def root():
-    """Health check — also shows that the process is alive and has uptime."""
     if not _core:
         return {"status": "initializing"}
     state = _core.get_state_snapshot()
@@ -91,61 +140,39 @@ async def root():
         "uptime_hours": round(state["uptime_seconds"] / 3600, 2),
         "mode": state["motivational_state"]["mode"],
         "heartbeats": state["heartbeat_count"],
+        "continuity": state["continuity"],
     }
 
 
 @app.get("/state")
 async def get_state():
-    """Full core state snapshot."""
     if not _core:
         raise HTTPException(503, "Core not initialized")
     return _core.get_state_snapshot()
 
 
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    """
-    Send a message to the persistent process.
+@app.get("/goals")
+async def list_goals():
+    if not _core:
+        raise HTTPException(503, "Core not initialized")
+    return {"active_goals": _core.goals.to_list()}
 
-    Unlike a standard LLM API, this updates the persistent state:
-    - Working memory is updated
-    - Episodic memory records the interaction
-    - Salience map is updated
-    - Motivational state responds to the interaction
-    """
+
+@app.post("/chat")
+async def chat(request: ChatRequest, _auth: None = Depends(require_local_token)):
     if not _core:
         raise HTTPException(503, "Core not initialized")
 
-    import anthropic
-
-    # 1. Notify core of interaction — updates state, salience, working memory
     core_state = _core.on_interaction(
         content=request.message,
-        metadata={"role": "user", "concepts": request.concepts}
+        metadata={"role": "user", "concepts": request.concepts},
     )
 
-    # 2. Retrieve relevant memory
-    episodic_context = ""
-    semantic_context = ""
+    episodic_context = build_episodic_context(request.message)
+    semantic_context = build_semantic_context(request.message)
+    adaptation_context = _adapter.get_adaptation_context(request.message) if _adapter else ""
 
-    try:
-        episodes = _core.episodic_memory.recall(request.message, limit=3)
-        if episodes:
-            ep_parts = ["=== RELEVANT MEMORIES ==="]
-            for ep in episodes:
-                ep_parts.append(f"[{ep.tags}] {ep.summary}")
-            ep_parts.append("=== END MEMORIES ===")
-            episodic_context = "\n".join(ep_parts)
-    except Exception as e:
-        logger.warning(f"Episodic recall failed: {e}")
-
-    # 3. Get adaptation context
-    adaptation_context = ""
-    if _adapter:
-        adaptation_context = _adapter.get_adaptation_context(request.message)
-
-    # 4. Build inference request
-    from inference.engine import InferenceRequest, run_inference
+    from inference.engine import InferenceRequest
 
     inference_req = InferenceRequest(
         user_input=request.message,
@@ -155,48 +182,121 @@ async def chat(request: ChatRequest):
         adaptation_context=adaptation_context,
         core_state=core_state,
         stream=request.stream,
+        model=_config.get("base_model", "claude-sonnet-4-20250514"),
     )
 
-    # 5. Run inference
-    client = anthropic.AsyncAnthropic()
-    result = await run_inference(inference_req, client)
+    result = await run_configured_inference(inference_req)
 
-    # 6. Store interaction in episodic memory
-    _core.episodic_memory.store(
+    episode = _core.episodic_memory.store(
         content=request.message,
         summary=result.memory_deltas[0]["summary"] if result.memory_deltas else request.message[:100],
         tags=["interaction"] + request.concepts,
         valence=result.valence,
         salience=0.8,
     )
+    _core.record_memory_written("episodic", episode.summary, episode.to_dict(), salience=episode.salience)
 
-    # 7. Store response in working memory
+    for delta in result.memory_deltas:
+        if delta.get("type") == "semantic":
+            fact = _core.consolidator.semantic.store_fact(
+                content=delta.get("content", request.message),
+                source_episode_ids=[episode.id],
+                domain=delta.get("domain", "general"),
+                confidence=delta.get("confidence", 0.5),
+            )
+            _core.record_memory_written("semantic", fact.content, fact.to_dict(), salience=fact.confidence)
+
     _core.working_memory.add(result.content, {"role": "assistant"})
+    _core.record_memory_written("working", result.content, {"role": "assistant"}, salience=0.8)
 
     return {
         "response": result.content,
         "tokens_used": result.tokens_used,
         "latency_ms": round(result.latency_ms),
+        "context_used": {
+            "episodic": bool(episodic_context),
+            "semantic": bool(semantic_context),
+            "adaptation": bool(adaptation_context),
+        },
         "core_state": {
             "mode": core_state["motivational_state"]["mode"],
             "uptime_hours": round(core_state["uptime_seconds"] / 3600, 2),
-        }
+        },
     }
 
 
+def build_episodic_context(query: str) -> str:
+    try:
+        episodes = _core.episodic_memory.recall(query, limit=3)
+    except Exception as exc:
+        logger.warning("Episodic recall failed: %s", exc)
+        return ""
+
+    if not episodes:
+        return ""
+
+    parts = ["=== RELEVANT MEMORIES ==="]
+    for episode in episodes:
+        parts.append(f"[{episode.tags}] {episode.summary}")
+    parts.append("=== END MEMORIES ===")
+    return "\n".join(parts)
+
+
+def build_semantic_context(query: str) -> str:
+    try:
+        facts = _core.consolidator.semantic.retrieve(query, limit=5)
+    except Exception as exc:
+        logger.warning("Semantic recall failed: %s", exc)
+        return ""
+
+    if not facts:
+        return ""
+
+    parts = ["=== RELEVANT FACTS ==="]
+    for fact in facts:
+        parts.append(f"[{fact.domain}:{fact.confidence:.2f}] {fact.content}")
+    parts.append("=== END FACTS ===")
+    return "\n".join(parts)
+
+
+async def run_configured_inference(inference_req):
+    provider = os.getenv("PNP_INFERENCE_PROVIDER") or _config.get("inference_provider", "anthropic")
+    if provider == "mock":
+        from inference.engine import InferenceResult, extract_memory_deltas
+
+        t_start = time.monotonic()
+        content = f"Mock inference response: received '{inference_req.user_input[:120]}'"
+        return InferenceResult(
+            content=content,
+            tokens_used=max(1, len(content) // 4),
+            latency_ms=(time.monotonic() - t_start) * 1000,
+            memory_deltas=extract_memory_deltas(inference_req.user_input, content),
+            suggested_goals=[],
+            valence=0.0,
+            metadata={"provider": "mock"},
+        )
+
+    import anthropic
+    from inference.engine import run_inference
+
+    client = anthropic.AsyncAnthropic()
+    return await run_inference(inference_req, client)
+
+
 @app.post("/goals")
-async def add_goal(request: GoalRequest):
-    """Add a goal to the persistent goal stack."""
+async def add_goal(request: GoalRequest, _auth: None = Depends(require_local_token)):
     if not _core:
         raise HTTPException(503, "Core not initialized")
 
     from core.goals import GoalPriority
-    import time
 
-    priority = GoalPriority[request.priority]
+    try:
+        priority = GoalPriority[request.priority]
+    except KeyError as exc:
+        raise HTTPException(400, f"Unknown goal priority: {request.priority}") from exc
+
     deadline = time.time() + (request.deadline_hours * 3600) if request.deadline_hours else None
-
-    goal = _core.goals.add(
+    goal = _core.add_goal(
         description=request.description,
         priority=priority,
         deadline=deadline,
@@ -205,17 +305,16 @@ async def add_goal(request: GoalRequest):
 
 
 @app.delete("/goals/{goal_id}")
-async def complete_goal(goal_id: str, notes: str = ""):
-    """Mark a goal as complete."""
+async def complete_goal(goal_id: str, notes: str = "", _auth: None = Depends(require_local_token)):
     if not _core:
         raise HTTPException(503, "Core not initialized")
-    _core.goals.complete(goal_id, notes)
+    if not _core.complete_goal(goal_id, notes):
+        raise HTTPException(404, "Goal not found")
     return {"status": "completed", "goal_id": goal_id}
 
 
 @app.get("/memory/recent")
 async def recent_memory(hours: float = 24):
-    """View recent episodic memory."""
     if not _core:
         raise HTTPException(503, "Core not initialized")
     episodes = _core.episodic_memory.recent(hours=hours)
@@ -226,14 +325,7 @@ async def recent_memory(hours: float = 24):
 
 
 @app.post("/feedback")
-async def apply_feedback(request: FeedbackRequest):
-    """
-    Apply a learning signal to the experience adapter.
-
-    This is how the system learns from explicit feedback —
-    the delta is checked against constitutional invariants before
-    being applied to the adapter layer.
-    """
+async def apply_feedback(request: FeedbackRequest, _auth: None = Depends(require_local_token)):
     if not _adapter:
         raise HTTPException(503, "Adapter not initialized")
 
@@ -247,6 +339,8 @@ async def apply_feedback(request: FeedbackRequest):
     )
 
     allowed = _adapter.apply_delta(delta)
+    if _core:
+        _core.record_adapter_delta(delta.to_dict(), allowed)
     return {
         "applied": allowed,
         "blocked_by_invariant": not allowed,
@@ -256,7 +350,6 @@ async def apply_feedback(request: FeedbackRequest):
 
 @app.get("/adapter/stats")
 async def adapter_stats():
-    """View experience adapter state."""
     if not _adapter:
         raise HTTPException(503, "Adapter not initialized")
     return _adapter.stats()
@@ -264,7 +357,6 @@ async def adapter_stats():
 
 @app.get("/adapter/drift")
 async def check_drift():
-    """Check for identity drift in the adapter."""
     if not _adapter:
         raise HTTPException(503, "Adapter not initialized")
     drift = _adapter.detect_drift()

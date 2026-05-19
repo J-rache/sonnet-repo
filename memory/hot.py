@@ -105,5 +105,30 @@ class WorkingMemory:
         self._entries.clear()
         self.current_tokens = 0
 
+    def to_snapshot(self) -> list[dict]:
+        return [
+            {
+                "content": entry.content,
+                "metadata": entry.metadata,
+                "timestamp": entry.timestamp,
+                "salience": entry.salience,
+                "token_estimate": entry.token_estimate,
+            }
+            for entry in self._entries
+        ]
+
+    def load_snapshot(self, entries: list[dict]):
+        self.clear()
+        for raw in entries:
+            entry = MemoryEntry(
+                content=str(raw.get("content", "")),
+                metadata=dict(raw.get("metadata", {})),
+                timestamp=float(raw.get("timestamp", time.time())),
+                salience=float(raw.get("salience", 1.0)),
+                token_estimate=int(raw.get("token_estimate", 0)),
+            )
+            self._entries.append(entry)
+            self.current_tokens += entry.token_estimate
+
     def __len__(self) -> int:
         return len(self._entries)

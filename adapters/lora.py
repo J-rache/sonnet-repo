@@ -52,6 +52,25 @@ class ExperienceDelta:
     confidence: float         # How confident we are in this learning signal
     timestamp: float = field(default_factory=time.time)
 
+    def to_dict(self) -> dict:
+        return {
+            "content": self.content,
+            "feedback": self.feedback,
+            "domain": self.domain,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "ExperienceDelta":
+        return cls(
+            content=str(raw.get("content", "")),
+            feedback=float(raw.get("feedback", 0.0)),
+            domain=str(raw.get("domain", "general")),
+            confidence=float(raw.get("confidence", 0.5)),
+            timestamp=float(raw.get("timestamp", time.time())),
+        )
+
 
 class ExperienceAdapter:
     """
@@ -72,6 +91,8 @@ class ExperienceAdapter:
         self.config = config
         self.adapter_path = config.get("adapter_path", "./data/adapter")
         os.makedirs(self.adapter_path, exist_ok=True)
+        self.MAX_DELTAS_IN_MEMORY = int(config.get("adapter_max_deltas_in_memory", self.MAX_DELTAS_IN_MEMORY))
+        self.CHECKPOINT_INTERVAL = int(config.get("adapter_checkpoint_interval", self.CHECKPOINT_INTERVAL))
 
         self._deltas: list[ExperienceDelta] = []
         self._update_count: int = 0
@@ -128,19 +149,34 @@ class ExperienceAdapter:
         This is how the adapter influences inference: by injecting
         learned patterns into the context, even without actual weight updates.
         """
-        relevant_deltas = [
-            d for d in self._deltas
-            if (domain is None or d.domain == domain)
-            and query.lower() in d.content.lower()
-            and d.feedback > 0.1  # Only include positively-reinforced patterns
-        ]
+        query_lower = query.lower().strip()
+        terms = {
+            token
+            for token in query_lower.replace("?", " ").replace(".", " ").split()
+            if len(token) > 2
+        }
 
-        if not relevant_deltas:
+        scored: list[tuple[int, ExperienceDelta]] = []
+        for delta in self._deltas:
+            if domain is not None and delta.domain != domain:
+                continue
+            if delta.feedback <= 0.1:
+                continue
+
+            content_lower = delta.content.lower()
+            score = 0
+            if query_lower and query_lower in content_lower:
+                score += 4
+            score += sum(1 for term in terms if term in content_lower)
+            if score > 0 or not query_lower:
+                scored.append((score, delta))
+
+        if not scored:
             return ""
 
         # Sort by recency and confidence
-        relevant_deltas.sort(key=lambda d: d.timestamp * d.confidence, reverse=True)
-        top_deltas = relevant_deltas[:5]
+        scored.sort(key=lambda item: (item[0], item[1].timestamp * item[1].confidence), reverse=True)
+        top_deltas = [delta for _, delta in scored[:5]]
 
         parts = ["=== LEARNED ADAPTATIONS ==="]
         for delta in top_deltas:
@@ -205,10 +241,7 @@ class ExperienceAdapter:
                 "timestamp": checkpoint.timestamp,
                 "update_count": checkpoint.update_count,
                 "domain_weights": self._domain_weights,
-                "recent_deltas": [
-                    {"content": d.content, "feedback": d.feedback, "domain": d.domain}
-                    for d in self._deltas[-10:]
-                ],
+                "recent_deltas": [d.to_dict() for d in self._deltas[-10:]],
             }, f, indent=2)
 
         self._checkpoints.append(checkpoint)
@@ -218,9 +251,12 @@ class ExperienceAdapter:
         state_path = os.path.join(self.adapter_path, "state.json")
         with open(state_path, "w") as f:
             json.dump({
+                "schema_version": 1,
+                "base_model_id": self.base_model_id,
                 "update_count": self._update_count,
                 "domain_weights": self._domain_weights,
                 "delta_count": len(self._deltas),
+                "deltas": [d.to_dict() for d in self._deltas[-self.MAX_DELTAS_IN_MEMORY:]],
             }, f, indent=2)
 
     def _load_state(self):
@@ -230,6 +266,10 @@ class ExperienceAdapter:
                 state = json.load(f)
             self._update_count = state.get("update_count", 0)
             self._domain_weights = state.get("domain_weights", {})
+            self._deltas = [
+                ExperienceDelta.from_dict(raw)
+                for raw in state.get("deltas", [])
+            ][-self.MAX_DELTAS_IN_MEMORY:]
 
     def stats(self) -> dict:
         return {

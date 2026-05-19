@@ -115,6 +115,21 @@ class MotivationalState:
             "mode": self._infer_mode(),
         }
 
+    def to_snapshot(self) -> dict:
+        return {
+            "arousal": self.arousal,
+            "focus": self.focus,
+            "curiosity": self.curiosity,
+            "urgency": self.urgency,
+        }
+
+    def load_snapshot(self, data: dict):
+        self.arousal = float(data.get("arousal", self.arousal))
+        self.focus = float(data.get("focus", self.focus))
+        self.curiosity = float(data.get("curiosity", self.curiosity))
+        self.urgency = float(data.get("urgency", self.urgency))
+        self._clamp()
+
     def _infer_mode(self) -> str:
         """Infer a human-readable mode label from state."""
         if self.arousal < 0.2:

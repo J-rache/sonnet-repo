@@ -75,6 +75,10 @@ class Goal:
             "priority": self.priority.name,
             "status": self.status.value,
             "progress": self.progress,
+            "created_at": self.created_at,
+            "deadline": self.deadline,
+            "parent_id": self.parent_id,
+            "notes": list(self.notes),
             "age_seconds": round(self.age_seconds),
             "urgency_score": round(self.urgency_score, 3),
             "is_overdue": self.is_overdue,
@@ -96,27 +100,39 @@ class GoalStack:
         self._goals: dict[str, Goal] = {}
 
     def add(self, description: str, priority: GoalPriority = GoalPriority.MEDIUM,
-            deadline: Optional[float] = None, parent_id: Optional[str] = None) -> Goal:
+            deadline: Optional[float] = None, parent_id: Optional[str] = None,
+            goal_id: Optional[str] = None, created_at: Optional[float] = None,
+            status: GoalStatus = GoalStatus.ACTIVE, progress: float = 0.0,
+            notes: Optional[list[str]] = None) -> Goal:
         goal = Goal(
             description=description,
             priority=priority,
+            status=status,
+            created_at=created_at or time.time(),
             deadline=deadline,
             parent_id=parent_id,
+            id=goal_id or str(uuid.uuid4())[:8],
+            progress=max(0.0, min(1.0, progress)),
+            notes=list(notes or []),
         )
         self._goals[goal.id] = goal
         return goal
 
-    def complete(self, goal_id: str, notes: str = ""):
+    def complete(self, goal_id: str, notes: str = "") -> bool:
         if goal_id in self._goals:
             self._goals[goal_id].status = GoalStatus.COMPLETED
             if notes:
                 self._goals[goal_id].add_note(notes)
+            return True
+        return False
 
-    def update_progress(self, goal_id: str, progress: float, notes: str = ""):
+    def update_progress(self, goal_id: str, progress: float, notes: str = "") -> bool:
         if goal_id in self._goals:
             self._goals[goal_id].progress = max(0.0, min(1.0, progress))
             if notes:
                 self._goals[goal_id].add_note(notes)
+            return True
+        return False
 
     def check_urgency(self) -> Optional[Goal]:
         """Return the most urgent active goal if above threshold."""
@@ -143,3 +159,32 @@ class GoalStack:
     def to_list(self) -> list[dict]:
         active = [g for g in self._goals.values() if g.status == GoalStatus.ACTIVE]
         return [g.to_dict() for g in sorted(active, key=lambda g: g.urgency_score, reverse=True)]
+
+    def to_snapshot(self) -> list[dict]:
+        return [g.to_dict() for g in self._goals.values()]
+
+    def load_snapshot(self, goals: list[dict]):
+        self._goals.clear()
+        for raw in goals:
+            self.upsert(raw)
+
+    def upsert(self, raw: dict) -> Goal:
+        priority = raw.get("priority", GoalPriority.MEDIUM.name)
+        if not isinstance(priority, GoalPriority):
+            priority = GoalPriority[str(priority)]
+
+        status = raw.get("status", GoalStatus.ACTIVE.value)
+        if not isinstance(status, GoalStatus):
+            status = GoalStatus(str(status))
+
+        return self.add(
+            description=str(raw.get("description", "")),
+            priority=priority,
+            deadline=raw.get("deadline"),
+            parent_id=raw.get("parent_id"),
+            goal_id=str(raw.get("id") or uuid.uuid4())[:8],
+            created_at=float(raw.get("created_at", time.time())),
+            status=status,
+            progress=float(raw.get("progress", 0.0)),
+            notes=list(raw.get("notes", [])),
+        )

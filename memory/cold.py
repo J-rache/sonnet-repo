@@ -15,6 +15,7 @@ import time
 import uuid
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -115,9 +116,28 @@ class SemanticMemory:
 
         facts = [self._row_to_fact(r) for r in rows]
 
-        # Filter by relevance
-        query_lower = query.lower()
-        relevant = [f for f in facts if query_lower in f.content.lower()]
+        query_lower = query.lower().strip()
+        terms = {
+            token
+            for token in query_lower.replace("?", " ").replace(".", " ").split()
+            if len(token) > 2
+        }
+
+        scored: list[tuple[int, SemanticFact]] = []
+        for fact in facts:
+            content_lower = fact.content.lower()
+            score = 0
+            if query_lower and query_lower in content_lower:
+                score += 4
+            score += sum(1 for term in terms if term in content_lower)
+            if score > 0 or not query_lower:
+                scored.append((score, fact))
+
+        scored.sort(
+            key=lambda item: (item[0], item[1].confidence, item[1].last_accessed),
+            reverse=True,
+        )
+        relevant = [fact for _, fact in scored]
 
         # Update access stats
         for fact in relevant[:limit]:
@@ -166,7 +186,3 @@ class SemanticMemory:
             "avg_confidence": round(avg_conf or 0, 3),
             "by_domain": {d: c for d, c in domains},
         }
-
-
-# Make Optional available
-from typing import Optional
