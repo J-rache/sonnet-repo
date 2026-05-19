@@ -27,6 +27,9 @@ Implemented behavior:
   falls back to local rules when no live provider is configured.
 - The process supervisor can restart a crashed child process and use `GET /` as
   a health probe.
+- `install.ps1` installs the app into a per-user standalone layout with copied
+  source, a dedicated venv, installed config, launchers, dependency install, and
+  optional Desktop shortcuts.
 
 Current limits:
 

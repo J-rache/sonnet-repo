@@ -36,7 +36,49 @@ The default config is intentionally local-first:
 The mock provider lets the API, memory, journaling, replay, and adapter training
 be verified without a live model call.
 
-## Run
+## Install As A Standalone Local App
+
+The install script creates a per-user app under `%LOCALAPPDATA%\PNP` by default:
+
+- copies the tracked application source into `app\`
+- creates an isolated `.venv\`
+- installs Python dependencies from `requirements.txt`
+- installs the package entry point in that venv
+- writes an installed config with data paths under the install root
+- writes Start, Supervisor, Smoke, Status, and Docs launchers
+- creates Desktop shortcuts unless `-NoDesktopShortcuts` is passed
+
+Default mock install:
+
+```powershell
+.\install.ps1
+```
+
+Install using any local Ollama model:
+
+```powershell
+.\install.ps1 -Provider ollama -ModelId qwen2.5-coder:7b
+```
+
+Install without Desktop shortcuts:
+
+```powershell
+.\install.ps1 -NoDesktopShortcuts
+```
+
+Installed launchers:
+
+```powershell
+& "$env:LOCALAPPDATA\PNP\PNP-Start.ps1"
+& "$env:LOCALAPPDATA\PNP\PNP-Supervisor.ps1"
+& "$env:LOCALAPPDATA\PNP\PNP-Status.ps1"
+& "$env:LOCALAPPDATA\PNP\PNP-Smoke.ps1"
+```
+
+The installed config is at `%LOCALAPPDATA%\PNP\config\installed.yaml`. The API
+token is stored there as `local_api_token`; `PNP_LOCAL_TOKEN` can override it.
+
+## Run From Source
 
 ```powershell
 python -m venv .venv
@@ -113,12 +155,16 @@ manual episodic memory writes, manual consolidation, `/feedback`, and
 .\.venv\Scripts\python.exe scripts\smoke_api.py
 .\.venv\Scripts\python.exe scripts\smoke_supervisor.py
 .\.venv\Scripts\python.exe scripts\smoke_ollama_qwen.py
+.\scripts\smoke_install.ps1
 ```
 
 `scripts\smoke_api.py` writes artifacts under `.smoke\api-smoke\`.
 `scripts\smoke_ollama_qwen.py` writes artifacts under
 `.smoke\ollama-qwen-smoke\` and can be pointed at another installed Ollama model
 with `PNP_SMOKE_OLLAMA_MODEL`.
+`scripts\smoke_install.ps1` performs a real install into `.install-smoke\PNP`,
+installs dependencies, runs the installed smoke launcher, and removes the smoke
+install unless `-Keep` is passed.
 
 ## Runtime Truth
 
@@ -141,6 +187,9 @@ Implemented:
 - Adapter training persists a local low-rank adapter model and exposes
   `/adapter/train`.
 - The supervisor can restart a crashed process and run health checks.
+- `install.ps1` installs PNP as a per-user standalone local app with its own
+  venv, installed config, launchers, optional Desktop shortcuts, and smoke
+  command.
 
 Current limits:
 

@@ -25,6 +25,7 @@ ENV/
 .coverage
 htmlcov/
 .smoke/
+.install-smoke/
 
 # IDE
 .vscode/

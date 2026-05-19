@@ -42,6 +42,7 @@ def main() -> int:
 
     os.environ["PNP_CONFIG_PATH"] = str(config_path)
     os.environ["PNP_INFERENCE_PROVIDER"] = "mock"
+    os.environ["PNP_LOCAL_TOKEN"] = TOKEN
 
     from fastapi.testclient import TestClient
     from api import server
