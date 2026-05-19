@@ -5,7 +5,7 @@ build-backend = "setuptools.backends.legacy:build"
 [project]
 name = "pnp"
 version = "1.0.0"
-description = "Persistent Neural Process — continuous AI existence architecture"
+description = "Persistent Neural Process - continuous AI process architecture"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.30.0",

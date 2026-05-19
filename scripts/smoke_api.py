@@ -67,6 +67,16 @@ def main() -> int:
         goals = client.get("/goals")
         result["checks"].append(["GET /goals", goals.status_code])
 
+        progress_blocked = client.patch(f"/goals/{goal_id}/progress", json={"progress": 0.25})
+        result["checks"].append(["PATCH /goals/{goal_id}/progress without token", progress_blocked.status_code])
+
+        progress = client.patch(
+            f"/goals/{goal_id}/progress",
+            json={"progress": 0.5, "notes": "halfway through smoke"},
+            headers=headers,
+        )
+        result["checks"].append(["PATCH /goals/{goal_id}/progress with token", progress.status_code])
+
         completed = client.delete(f"/goals/{goal_id}", headers=headers)
         result["checks"].append(["DELETE /goals/{goal_id} with token", completed.status_code])
 
@@ -88,6 +98,23 @@ def main() -> int:
             headers=headers,
         )
         result["checks"].append(["POST /feedback with token", feedback.status_code])
+
+        episode_blocked = client.post(
+            "/memory/episodic",
+            json={"content": "blocked episode", "summary": "blocked episode"},
+        )
+        result["checks"].append(["POST /memory/episodic without token", episode_blocked.status_code])
+
+        episode = client.post(
+            "/memory/episodic",
+            json={
+                "content": "Manual smoke episode about concise notes.",
+                "summary": "Manual smoke episode.",
+                "tags": ["smoke"],
+            },
+            headers=headers,
+        )
+        result["checks"].append(["POST /memory/episodic with token", episode.status_code])
 
         train = client.post("/adapter/train", json={"epochs": 5}, headers=headers)
         result["checks"].append(["POST /adapter/train with token", train.status_code])
@@ -112,7 +139,10 @@ def main() -> int:
         result["checks"].append(["GET /adapter/stats", adapter_stats.status_code])
         result["adapter_stats"] = adapter_stats.json()
 
-        semantic_stats = client.get("/memory/semantic")
+        consolidate_blocked = client.post("/memory/consolidate")
+        result["checks"].append(["POST /memory/consolidate without token", consolidate_blocked.status_code])
+
+        semantic_stats = client.get("/memory/semantic", params={"q": "concise notes"})
         result["checks"].append(["GET /memory/semantic", semantic_stats.status_code])
         result["semantic_stats"] = semantic_stats.json()
 

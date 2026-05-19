@@ -59,6 +59,12 @@ def test_api_smoke_without_live_model_call(monkeypatch, tmp_path):
         )
         assert goal_response.status_code == 200
         goal_id = goal_response.json()["goal_id"]
+        assert client.patch(f"/goals/{goal_id}/progress", json={"progress": 0.5}).status_code == 401
+        assert client.patch(
+            f"/goals/{goal_id}/progress",
+            json={"progress": 0.5, "notes": "verified"},
+            headers=headers,
+        ).status_code == 200
         assert client.delete(f"/goals/{goal_id}", headers=headers).status_code == 200
 
         server._core.consolidator.semantic.store_fact(
@@ -81,6 +87,24 @@ def test_api_smoke_without_live_model_call(monkeypatch, tmp_path):
         assert feedback_response.status_code == 200
         assert feedback_response.json()["applied"] is True
 
+        assert client.post(
+            "/memory/episodic",
+            json={"content": "blocked manual memory", "summary": "blocked manual memory"},
+        ).status_code == 401
+        assert client.post(
+            "/memory/episodic",
+            json={
+                "content": "Manual memory about concise implementation notes.",
+                "summary": "Manual concise memory.",
+                "tags": ["manual"],
+            },
+            headers=headers,
+        ).status_code == 200
+
+        train_response = client.post("/adapter/train", json={"epochs": 3}, headers=headers)
+        assert train_response.status_code == 200
+        assert train_response.json()["metrics"]["sample_count"] >= 1
+
         chat_response = client.post(
             "/chat",
             json={
@@ -92,17 +116,21 @@ def test_api_smoke_without_live_model_call(monkeypatch, tmp_path):
         assert chat_response.status_code == 200
         body = chat_response.json()
         assert body["response"].startswith("Mock inference response")
+        assert body["provider"] == "mock"
         assert body["context_used"]["semantic"] is True
         assert body["context_used"]["adaptation"] is True
 
         recent = client.get("/memory/recent").json()
         assert recent["stats"]["total_episodes"] >= 1
+        assert client.post("/memory/consolidate").status_code == 401
 
     journal_path = tmp_path / "runtime" / "events.jsonl"
     assert {
         "interaction_received",
         "goal_added",
+        "goal_progress_updated",
         "goal_completed",
         "memory_written",
         "adapter_delta_applied",
+        "adapter_trained",
     }.issubset(event_types(journal_path))

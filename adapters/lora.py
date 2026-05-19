@@ -87,6 +87,8 @@ class ExperienceAdapter:
         self._checkpoints: list[AdapterCheckpoint] = []
         self._domain_weights: dict[str, float] = {}
         self._engine = None
+        self._last_training_metrics: dict = {}
+        self._last_trained_at: Optional[float] = None
 
         self._load_state()
         self._load_deltas()
@@ -170,12 +172,12 @@ class ExperienceAdapter:
             self._checkpoint()
 
         self._save_deltas()
-        self._save_low_rank()
         if self.config.get("adapter_auto_train", True):
             min_d = self.config.get("adapter_train_min_deltas", 1)
             interval = self.config.get("adapter_train_interval", 1)
             if len(self._deltas) >= min_d and self._update_count % max(interval, 1) == 0:
                 self._train_low_rank()
+        self._save_low_rank()
         self._save_state()
         return True
 
@@ -284,6 +286,18 @@ class ExperienceAdapter:
 
         return None
 
+    def train_adapter(self, epochs: Optional[int] = None) -> dict:
+        """
+        Public training hook used by the API and smoke tests.
+
+        This trains the local low-rank adapter over persisted experience
+        deltas. It does not modify any external provider's private weights.
+        """
+        metrics = self._train_low_rank(epochs=epochs)
+        self._save_low_rank()
+        self._save_state()
+        return metrics
+
     def _save_low_rank(self):
         if not hasattr(self, "_low_rank") or self._low_rank is None:
             return
@@ -293,10 +307,17 @@ class ExperienceAdapter:
         except Exception as e:
             logger.warning(f"LowRankAdapterModel save failed: {e}")
 
-    def _train_low_rank(self):
+    def _train_low_rank(self, epochs: Optional[int] = None) -> dict:
         """Train low_rank adapter on current deltas using their embeddings."""
         if not hasattr(self, "_low_rank") or self._low_rank is None:
-            return
+            return {
+                "sample_count": 0,
+                "epochs": 0,
+                "loss_before": 0.0,
+                "loss_after": 0.0,
+                "improved": False,
+                "reason": "low_rank_adapter_unavailable",
+            }
         eng = self._get_engine()
         samples = []
         dim = self._low_rank.dimensions
@@ -318,14 +339,37 @@ class ExperienceAdapter:
                     pseudo.append(0.0)
                 samples.append((pseudo[:dim], d.feedback, d.confidence))
         if not samples:
-            return
+            metrics = {
+                "sample_count": 0,
+                "epochs": 0,
+                "loss_before": 0.0,
+                "loss_after": 0.0,
+                "improved": False,
+                "reason": "no_deltas",
+            }
+            self._last_training_metrics = metrics
+            return metrics
         try:
-            epochs = self.config.get("adapter_training_epochs", 80)
+            train_epochs = epochs or self.config.get("adapter_training_epochs", 80)
             lr = float(self.config.get("adapter_learning_rate", 0.05))
-            metrics = self._low_rank.train(samples, epochs=epochs, learning_rate=lr)
-            logger.debug(f"LowRank trained: {metrics.to_dict()}")
+            raw_metrics = self._low_rank.train(samples, epochs=train_epochs, learning_rate=lr)
+            metrics = raw_metrics.to_dict()
+            self._last_training_metrics = metrics
+            self._last_trained_at = time.time()
+            logger.debug(f"LowRank trained: {metrics}")
+            return metrics
         except Exception as e:
             logger.warning(f"LowRank training failed: {e}")
+            metrics = {
+                "sample_count": len(samples),
+                "epochs": epochs or self.config.get("adapter_training_epochs", 80),
+                "loss_before": 0.0,
+                "loss_after": 0.0,
+                "improved": False,
+                "reason": f"training_failed: {e}",
+            }
+            self._last_training_metrics = metrics
+            return metrics
 
     def _checkpoint(self):
         ckpt_id = f"ckpt_{self._update_count}_{int(time.time())}"
@@ -361,6 +405,8 @@ class ExperienceAdapter:
                 "blocked_count": self._blocked_count,
                 "domain_weights": self._domain_weights,
                 "delta_count": len(self._deltas),
+                "last_training_metrics": self._last_training_metrics,
+                "last_trained_at": self._last_trained_at,
             }, f, indent=2)
 
     def _load_state(self):
@@ -373,6 +419,8 @@ class ExperienceAdapter:
             self._update_count = state.get("update_count", 0)
             self._blocked_count = state.get("blocked_count", 0)
             self._domain_weights = state.get("domain_weights", {})
+            self._last_training_metrics = state.get("last_training_metrics", {})
+            self._last_trained_at = state.get("last_trained_at")
         except Exception as e:
             logger.warning(f"Adapter state load failed: {e}")
 
@@ -392,6 +440,8 @@ class ExperienceAdapter:
             "checkpoints": len(self._checkpoints),
             "domain_weights": self._domain_weights,
             "drift_status": self.detect_drift(),
+            "last_training_metrics": self._last_training_metrics,
+            "last_trained_at": self._last_trained_at,
             "embedding_engine": self._get_engine().stats() if self._get_engine() else None,
         }
 

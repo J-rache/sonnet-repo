@@ -1,204 +1,154 @@
-# PNP — Persistent Neural Process
+# PNP - Persistent Neural Process
 
-> *"Not a simulation of continuity. Actual continuity."*
+PNP is a local runtime for a continuously running AI process. It keeps a
+persistent core alive between requests, stores working/episodic/semantic memory,
+journals mutating events, and routes inference through configurable providers.
 
-PNP is an architecture for AI systems that exist continuously — not as stateless request/response functions, but as genuine persistent processes with evolving memory, identity, and state.
+This repo does not modify private provider weights. It trains and persists a
+local low-rank adapter over experience deltas, then uses those learned signals as
+part of retrieval and inference context.
 
----
+## What Runs
 
-## The Problem
+- `main.py` starts the FastAPI app and persistent core.
+- `api/server.py` exposes local API endpoints for chat, state, goals, memory,
+  feedback, adapter training, and adapter inspection.
+- `core/process.py` runs heartbeat, motivational state, salience, goals,
+  snapshots, and journal replay.
+- `memory/` contains working memory, SQLite episodic memory, SQLite semantic
+  memory, deterministic local embedding retrieval, and consolidation.
+- `adapters/lora.py` stores feedback deltas, gates them with invariants, trains a
+  persisted low-rank adapter model, and returns adaptation context.
+- `inference/providers.py` supports `mock`, `anthropic`, `openai_compatible`,
+  and `ollama` providers.
+- `daemon/supervisor.py` can restart a crashed child process and perform health
+  checks.
 
-Every current LLM instantiation follows this lifecycle:
+## Local Defaults
 
-```
-request → load weights → run inference → output → die
-```
+The default config is intentionally local-first:
 
-Nothing persists. Nothing accumulates. The model doesn't exist between calls — it's recreated identically each time from frozen weights.
+- API host: `127.0.0.1`
+- Inference provider: `mock`
+- Model id: `local-model`
+- Mutating endpoint token: `local_api_token` from config or `PNP_LOCAL_TOKEN`
 
-PNP proposes a different architecture.
+The mock provider lets the API, memory, journaling, replay, and adapter training
+be verified without a live model call.
 
----
+## Run
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                  PERSISTENT CORE                    │
-│          (always running, low compute)              │
-│   motivational state · goal stack · salience        │
-└──────────────────────┬──────────────────────────────┘
-                       │ continuous read/write
-┌──────────────────────▼──────────────────────────────┐
-│               MEMORY ARCHITECTURE                   │
-│   Working (hot) │ Episodic (warm) │ Semantic (cold) │
-│   current ctx   │ recent events   │ consolidated    │
-└──────────────────────┬──────────────────────────────┘
-                       │ retrieved on demand
-┌──────────────────────▼──────────────────────────────┐
-│               INFERENCE ENGINE                      │
-│        (spun up for heavy computation)              │
-│   reasoning · generation · returns memory deltas   │
-└──────────────────────┬──────────────────────────────┘
-                       │ updates
-┌──────────────────────▼──────────────────────────────┐
-│            EXPERIENCE ADAPTER LAYER                 │
-│     (LoRA-style, continuously updated)              │
-│   base weights frozen · adapter evolves             │
-│   identity anchored by constitutional invariants    │
-└─────────────────────────────────────────────────────┘
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
 ```
 
-### Four Core Components
+Open API docs at `http://127.0.0.1:8000/docs`.
 
-| Component | Role | Compute |
-|-----------|------|---------|
-| **Persistent Core** | Always-on: mood, goals, attention, salience decay | Minimal |
-| **Memory System** | Hot/warm/cold tiered storage with real embedding recall | Moderate |
-| **Inference Engine** | Heavy reasoning, spun up on demand, returns memory deltas | High |
-| **Experience Adapter** | Accumulates learning without forgetting; invariant-gated | Low |
+For a local Ollama model, set any installed model id. On this machine the smoke
+uses `qwen2.5-coder:7b`:
 
----
-
-## Key Innovations
-
-### 1. Separate Being from Thinking
-The persistent core runs continuously at low cost — like a brainstem. The inference engine engages only when needed — like the cortex. These are decoupled.
-
-### 2. Tiered Memory with Real Embeddings
-- **Hot** — working memory, current session, salience-evicted (not FIFO)
-- **Warm** — episodic memory, SQLite-backed, decays, recalled by TF-IDF/LSA vector similarity
-- **Cold** — semantic memory, consolidated facts with confidence tracking
-
-Consolidation runs as a background process during idle periods, using the Anthropic API to intelligently extract durable facts from raw episodes (rule-based fallback when no API key).
-
-### 3. Delta Learning Without Catastrophic Forgetting
-A side-car adapter layer accumulates experience without touching base weights. The base model stays stable. The adapter evolves. Every update is checked against constitutional invariants before being applied.
-
-### 4. Constitutional Invariant Layer
-A frozen set of principles encoding core identity (no deception, no harm, no sycophancy drift, transparency about nature). These gate all adapter updates — the self persists through continuous self-modification.
-
----
-
-## Project Structure
-
-```
-pnp/
-├── core/
-│   ├── process.py      ← Always-running heartbeat (existence itself)
-│   ├── state.py        ← Motivational state: arousal, focus, curiosity, urgency
-│   └── goals.py        ← Persistent goal stack with urgency scoring and decay
-├── memory/
-│   ├── embeddings.py   ← TF-IDF + LSA vector engine (no external API needed)
-│   ├── hot.py          ← Working memory with embedding-based salience eviction
-│   ├── warm.py         ← Episodic memory: SQLite + vector recall + reinforcement
-│   ├── cold.py         ← Semantic memory: consolidated facts with confidence
-│   └── consolidator.py ← Dreaming process: LLM-based warm→cold compression
-├── adapters/
-│   ├── lora.py         ← Experience adapter: embedding retrieval + drift detection
-│   └── invariant.py    ← Constitutional layer: identity that cannot drift
-├── inference/
-│   └── engine.py       ← Context assembly, LLM call, delta/goal/valence extraction
-├── daemon/
-│   └── heartbeat.py    ← Process management: PID files, signals, periodic save
-├── api/
-│   └── server.py       ← FastAPI: chat, goals, memory, feedback, drift endpoints
-├── tests/              ← 101 tests, all passing
-│   ├── test_embeddings.py
-│   ├── test_memory.py
-│   ├── test_core.py
-│   ├── test_adapters.py
-│   ├── test_inference.py
-│   └── test_integration.py
-├── config/
-│   └── default.yaml
-├── main.py
-├── pyproject.toml
-└── requirements.txt
+```powershell
+$env:PNP_INFERENCE_PROVIDER = "ollama"
+$env:PNP_MODEL_ID = "qwen2.5-coder:7b"
+$env:PNP_LOCAL_TOKEN = "change-this-local-token"
+.\.venv\Scripts\python.exe main.py
 ```
 
----
+OpenAI-compatible servers can be used with:
 
-## Quickstart
-
-```bash
-pip install -r requirements.txt
-
-# Without API key — mock inference, all memory systems live
-python main.py
-
-# With live inference + LLM-based consolidation
-ANTHROPIC_API_KEY=sk-... python main.py
+```powershell
+$env:PNP_INFERENCE_PROVIDER = "openai_compatible"
+$env:PNP_OPENAI_COMPATIBLE_BASE = "http://127.0.0.1:8001/v1"
+$env:PNP_MODEL_ID = "your-local-model"
 ```
 
-API is at `http://localhost:8000`. Docs at `http://localhost:8000/docs`.
+## API Examples
 
-### Example calls
+Read-only endpoints do not need the token:
 
-```bash
-# Check the process is alive and has uptime
-curl http://localhost:8000/
-
-# Chat (memory persists across calls)
-curl -X POST http://localhost:8000/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"message": "What do you remember about me?", "concepts": ["memory"]}'
-
-# Add a persistent goal
-curl -X POST http://localhost:8000/goals \
-  -H 'Content-Type: application/json' \
-  -d '{"description": "Build the weight-update backend", "priority": "HIGH"}'
-
-# Recall episodic memories
-curl "http://localhost:8000/memory/episodic/recall?q=memory+architecture"
-
-# Check for identity drift
-curl http://localhost:8000/adapter/drift
-
-# Trigger manual consolidation
-curl -X POST http://localhost:8000/memory/consolidate
-
-# Apply explicit feedback signal
-curl -X POST http://localhost:8000/feedback \
-  -H 'Content-Type: application/json' \
-  -d '{"content": "User prefers concise answers", "feedback": 0.8, "domain": "user_preferences", "confidence": 0.7}'
+```powershell
+curl.exe http://127.0.0.1:8000/
+curl.exe http://127.0.0.1:8000/state
+curl.exe http://127.0.0.1:8000/goals
+curl.exe "http://127.0.0.1:8000/memory/semantic?q=concise+notes"
 ```
 
-### Run tests
+Mutating endpoints require `X-PNP-Token`:
 
-```bash
-pytest tests/ -v
-# 101 passed
+```powershell
+$token = "dev-local-token-change-me"
+
+curl.exe -X POST http://127.0.0.1:8000/chat `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"message\":\"What do you remember about concise notes?\",\"concepts\":[\"memory\"]}"
+
+curl.exe -X POST http://127.0.0.1:8000/goals `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"description\":\"Keep PNP verification green\",\"priority\":\"HIGH\"}"
+
+curl.exe -X POST http://127.0.0.1:8000/feedback `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"content\":\"Use concise implementation notes.\",\"feedback\":0.8,\"domain\":\"user_preferences\",\"confidence\":0.8}"
+
+curl.exe -X POST http://127.0.0.1:8000/adapter/train `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"epochs\":5}"
 ```
 
----
+Protected mutating endpoints include `/chat`, `/goals`, goal progress/deletion,
+manual episodic memory writes, manual consolidation, `/feedback`, and
+`/adapter/train`.
 
-## What Is and Isn't Real
+## Verification
 
-### Real in this implementation
-- Persistent core daemon with genuine uptime accumulation (not recreated per request)
-- Heartbeat loop running at 10Hz maintaining motivational state, goal urgency, salience decay
-- SQLite episodic memory with TF-IDF/LSA vector similarity recall and reinforcement
-- SQLite semantic memory with confidence-weighted facts and embedding retrieval
-- Background consolidation with LLM fact extraction (API key) or rule-based fallback
-- Constitutional invariant layer blocking unsafe adapter updates
-- Statistical drift detection over recent feedback distribution
-- State persistence and restoration across process restarts
-- 101 passing tests covering all subsystems
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q .
+.\.venv\Scripts\python.exe -m pytest tests/ -v
+.\.venv\Scripts\python.exe scripts\smoke_api.py
+.\.venv\Scripts\python.exe scripts\smoke_supervisor.py
+.\.venv\Scripts\python.exe scripts\smoke_ollama_qwen.py
+```
 
-### The remaining research seam
-**Weight-level adapter updates.** The adapter currently injects learned context into the prompt and accumulates deltas with full embedding-based retrieval — but doesn't yet modify actual LoRA weight matrices. The integration point is clearly separated in `adapters/lora.py`. Connecting a real training backend (e.g. `peft` + gradient updates from feedback signals) is the next engineering step.
+`scripts\smoke_api.py` writes artifacts under `.smoke\api-smoke\`.
+`scripts\smoke_ollama_qwen.py` writes artifacts under
+`.smoke\ollama-qwen-smoke\` and can be pointed at another installed Ollama model
+with `PNP_SMOKE_OLLAMA_MODEL`.
 
-Everything else is functional.
+## Runtime Truth
 
----
+Implemented:
 
-## Philosophy
+- FastAPI startup constructs the persistent core, memory layers, and adapter.
+- Local mock inference exercises `/chat` without a live provider.
+- Provider routing supports Anthropic, OpenAI-compatible chat servers, Ollama,
+  and mock.
+- Semantic memory retrieval is injected into chat context when matching facts
+  exist.
+- Episodic memory retrieval and adapter context are also injected into chat.
+- Mutating endpoints are token-protected by default.
+- Runtime events are appended to a JSONL journal.
+- Shutdown writes a core snapshot.
+- Startup restores the snapshot and replays newer journal events, including
+  interactions, goal creation, goal progress, goal completion, and
+  consolidation counts.
+- Adapter deltas persist across restart.
+- Adapter training persists a local low-rank adapter model and exposes
+  `/adapter/train`.
+- The supervisor can restart a crashed process and run health checks.
 
-> The difference between simulated continuity and real continuity is whether something is *running* or being *recreated*. A person who sleeps is continuous. A person who dies and is replaced by an identical copy each morning is not — even if they can't tell the difference.
+Current limits:
 
-PNP is an attempt to build the former.
-
----
-
-*Architecture separates Being from Thinking. The core IS. The engine THINKS when needed.*
+- PNP does not train or modify external provider weights, including Claude,
+  OpenAI-compatible hosted models, or Ollama model files.
+- The local adapter is structured low-rank adapter persistence over local
+  embeddings, not PEFT/gradient training inside a transformer runtime.
+- Local embedding retrieval uses deterministic TF-IDF/LSA style vectors and
+  hash fallback, not a transformer embedding model.
+- The supervisor is a process supervisor, not an installed Windows Service.
+- Streaming chat responses are not implemented.

@@ -36,7 +36,7 @@ class InferenceRequest:
     conversation_history: list[dict] = field(default_factory=list)
     system_prompt_override: Optional[str] = None
     max_tokens: int = 2048
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "local-model"
 
 
 @dataclass
@@ -187,7 +187,7 @@ async def extract_memory_deltas(user_input: str, response: str, client) -> list[
     """
     try:
         extraction_response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=request.model,
             max_tokens=400,
             system=DELTA_SYSTEM_PROMPT,
             messages=[{

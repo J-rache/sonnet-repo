@@ -1,9 +1,11 @@
 # PNP Default Configuration
 
 # Model/provider
-base_model: "claude-haiku-4-5-20251001"
-model_id: "claude-haiku-4-5-20251001"
-inference_provider: "anthropic"
+# Defaults are local and no-live-call safe. Select any installed local model by
+# setting PNP_INFERENCE_PROVIDER=ollama and PNP_MODEL_ID=<model>.
+base_model: "local-model"
+model_id: "local-model"
+inference_provider: "mock"
 
 providers:
   anthropic:
@@ -33,6 +35,8 @@ journal_path: "./data/events.jsonl"
 consolidation_batch_size: 20
 episodic_decay_rate_per_hour: 0.02
 episodic_consolidation_threshold: 0.15
+consolidation_model_id: "local-model"
+consolidation_max_tokens: 1000
 
 # Adapter
 adapter_checkpoint_interval: 100
@@ -47,7 +51,7 @@ adapter_train_interval: 1
 adapter_seed: "pnp"
 
 # API
-api_host: "0.0.0.0"
+api_host: "127.0.0.1"
 api_port: 8000
 api_log_level: "info"
 local_api_token_env: "PNP_LOCAL_TOKEN"

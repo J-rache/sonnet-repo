@@ -1,22 +1,21 @@
 """
 memory/consolidator.py
 
-The Consolidator — background process that compresses episodic memory
-into semantic memory during idle periods.
-
-Uses the Anthropic API to intelligently extract durable facts from
-low-salience episodes — the system's equivalent of sleep consolidation.
-Falls back to rule-based extraction when API is unavailable.
+Background process that compresses episodic memory into semantic memory during
+idle periods. It can ask the configured inference provider to extract durable
+facts, then falls back to rules when no live provider is available.
 """
 
-import logging
-import time
+from __future__ import annotations
+
 import json
+import logging
 import os
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from memory.warm import EpisodicMemory, Episode
+    from memory.warm import EpisodicMemory
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +26,10 @@ Your job: given a list of episodic memory summaries, extract durable semantic fa
 that should be retained long-term.
 
 Rules:
-- Extract only facts that are genuinely durable (not session-specific noise)
+- Extract only facts that are genuinely durable, not session-specific noise
 - Classify each fact into one of: user_preferences, world_knowledge, self_knowledge, general
 - Rate confidence 0.0-1.0 based on how certain and stable the fact is
-- Be concise — facts should be 1-2 sentences max
+- Be concise; facts should be 1-2 sentences max
 - Skip trivial interactions that contain no lasting information
 
 Respond ONLY with valid JSON, no markdown, no explanation:
@@ -46,12 +45,9 @@ class Consolidator:
     """
     Runs during idle periods to:
     1. Decay old episodic salience
-    2. Call LLM to extract semantic facts from low-salience episodes
+    2. Extract semantic facts from low-salience episodes
     3. Store extracted facts in semantic memory
     4. Mark consolidated episodes
-
-    Uses Anthropic API for intelligent fact extraction when available,
-    falls back to rule-based extraction when not.
     """
 
     def __init__(self, episodic_memory: "EpisodicMemory", config: dict):
@@ -62,35 +58,32 @@ class Consolidator:
         self._total_facts_extracted: int = 0
 
         from memory.cold import SemanticMemory
+
         self.semantic = SemanticMemory(
             db_path=config.get("semantic_db_path", "./data/semantic.db"),
             embed_path=config.get("embed_path", "./data/embeddings.pkl"),
         )
 
     async def run_cycle(self, current_salience: dict) -> dict:
-        """
-        Run one consolidation cycle. Called during idle periods.
-        """
+        """Run one consolidation cycle."""
         cycle_start = time.time()
         logger.info("Consolidation cycle starting.")
 
-        # Step 1: Decay episodic salience
         self.episodic.run_decay()
-
-        # Step 2: Get candidates
         candidates = self.episodic.get_consolidation_candidates(limit=20)
-        logger.info(f"Found {len(candidates)} episodes for consolidation.")
+        logger.info("Found %s episodes for consolidation.", len(candidates))
 
         if not candidates:
-            return {"episodes_consolidated": 0, "facts_extracted": 0,
-                    "duration_seconds": round(time.time() - cycle_start, 2)}
+            return {
+                "episodes_consolidated": 0,
+                "facts_extracted": 0,
+                "duration_seconds": round(time.time() - cycle_start, 2),
+            }
 
-        # Step 3: Extract facts via LLM (with fallback)
-        facts = await self._extract_facts_llm(candidates)
+        facts = await self._extract_facts_provider(candidates)
         if not facts:
             facts = self._extract_facts_rules(candidates)
 
-        # Step 4: Store facts in semantic memory
         for fact in facts:
             self.semantic.store_fact(
                 content=fact["content"],
@@ -99,7 +92,6 @@ class Consolidator:
                 confidence=fact["confidence"],
             )
 
-        # Step 5: Mark as consolidated
         ids = [ep.id for ep in candidates]
         self.episodic.mark_consolidated(ids)
 
@@ -108,76 +100,90 @@ class Consolidator:
         duration = time.time() - cycle_start
         self._last_run = time.time()
 
-        logger.info(
-            f"Consolidation done: {len(ids)} episodes → {len(facts)} facts in {duration:.2f}s"
-        )
+        logger.info("Consolidation done: %s episodes -> %s facts in %.2fs", len(ids), len(facts), duration)
         return {
             "episodes_consolidated": len(ids),
             "facts_extracted": len(facts),
             "duration_seconds": round(duration, 2),
         }
 
-    async def _extract_facts_llm(self, episodes: list) -> list[dict]:
-        """
-        Use Anthropic API to extract durable facts from episodes.
-        Returns list of {content, domain, confidence, source_ids} dicts.
-        """
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
+    async def _extract_facts_provider(self, episodes: list) -> list[dict]:
+        """Use the configured inference provider to extract durable facts."""
+        provider_name = os.environ.get("PNP_INFERENCE_PROVIDER") or self.config.get("inference_provider", "mock")
+        if provider_name.lower() == "mock":
             return []
 
         try:
-            import anthropic
-            client = anthropic.AsyncAnthropic(api_key=api_key)
+            from inference.engine import InferenceRequest
+            from inference.providers import provider_from_config
 
-            # Build the episode summaries for the prompt
-            episode_text = "\n".join([
+            episode_text = "\n".join(
                 f"- [{ep.tags}] {ep.summary} (valence={ep.valence:.1f}, reinforced={ep.reinforcement_count}x)"
                 for ep in episodes
-            ])
-
-            response = await client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1000,
-                system=EXTRACTION_SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": f"Extract durable facts from these episodic memories:\n\n{episode_text}"
-                }],
             )
-
-            raw = response.content[0].text.strip()
-            # Strip any accidental markdown fences
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            parsed = json.loads(raw)
-            facts = parsed.get("facts", [])
-
-            # Attach source episode IDs (all episodes contributed)
-            ep_ids = [ep.id for ep in episodes]
-            for f in facts:
-                f["source_ids"] = ep_ids
-                f["confidence"] = max(0.0, min(1.0, float(f.get("confidence", 0.5))))
-                if f.get("domain") not in {"user_preferences", "world_knowledge",
-                                            "self_knowledge", "general"}:
-                    f["domain"] = "general"
-
-            logger.debug(f"LLM extracted {len(facts)} facts from {len(episodes)} episodes")
-            return facts
-
+            user_input = f"Extract durable facts from these episodic memories:\n\n{episode_text}"
+            model = (
+                os.environ.get("PNP_CONSOLIDATION_MODEL_ID")
+                or os.environ.get("PNP_MODEL_ID")
+                or os.environ.get("PNP_MODEL")
+                or self.config.get("consolidation_model_id")
+                or self.config.get("model_id")
+                or self.config.get("base_model")
+                or "local-model"
+            )
+            request = InferenceRequest(
+                user_input=user_input,
+                working_memory_context="",
+                episodic_context="",
+                semantic_context="",
+                adaptation_context="",
+                core_state={},
+                model=model,
+                max_tokens=int(self.config.get("consolidation_max_tokens", 1000)),
+            )
+            provider = provider_from_config(self.config)
+            provider_response = await provider.generate(
+                request,
+                EXTRACTION_SYSTEM_PROMPT,
+                [{"role": "user", "content": user_input}],
+            )
+            return self._parse_provider_facts(provider_response.content, episodes)
         except Exception as e:
-            logger.warning(f"LLM fact extraction failed, using rules: {e}")
+            logger.warning("Provider fact extraction failed, using rules: %s", e)
             return []
 
-    def _extract_facts_rules(self, episodes: list) -> list[dict]:
-        """
-        Rule-based fact extraction fallback.
-        Produces lower-quality but always-available output.
-        """
-        facts = []
+    def _parse_provider_facts(self, raw_text: str, episodes: list) -> list[dict]:
+        raw = raw_text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw)
+        facts = parsed.get("facts", [])
+
         ep_ids = [ep.id for ep in episodes]
+        normalized = []
+        for fact in facts:
+            if not isinstance(fact, dict) or not fact.get("content"):
+                continue
+            domain = fact.get("domain", "general")
+            if domain not in {"user_preferences", "world_knowledge", "self_knowledge", "general"}:
+                domain = "general"
+            normalized.append(
+                {
+                    "content": str(fact["content"]),
+                    "domain": domain,
+                    "confidence": max(0.0, min(1.0, float(fact.get("confidence", 0.5)))),
+                    "source_ids": ep_ids,
+                }
+            )
+
+        logger.debug("Provider extracted %s facts from %s episodes", len(normalized), len(episodes))
+        return normalized
+
+    def _extract_facts_rules(self, episodes: list) -> list[dict]:
+        """Rule-based fact extraction fallback."""
+        facts = []
 
         for ep in episodes:
             tags_lower = [t.lower() for t in ep.tags]

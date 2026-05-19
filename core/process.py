@@ -28,6 +28,18 @@ from core.journal import EventJournal
 logger = logging.getLogger(__name__)
 
 
+def _runtime_data_dir(config: dict) -> str:
+    if config.get("data_dir"):
+        return config["data_dir"]
+    for key in ("episodic_db_path", "semantic_db_path", "embed_path", "adapter_path"):
+        path = config.get(key)
+        if path:
+            parent = os.path.dirname(path)
+            if parent:
+                return parent
+    return "./data"
+
+
 @dataclass
 class CoreMetrics:
     uptime_start: float = field(default_factory=time.time)
@@ -84,7 +96,8 @@ class PersistentCore:
 
         self.salience: dict[str, float] = {}
         self.replay_summary: dict = {}
-        journal_path = config.get("journal_path", "./data/events.jsonl")
+        data_dir = _runtime_data_dir(config)
+        journal_path = config.get("journal_path", os.path.join(data_dir, "events.jsonl"))
         self.journal = EventJournal(journal_path)
         self._restore_state()
         logger.info(f"PersistentCore initialized. Uptime start: {datetime.now(timezone.utc).isoformat()}Z")
@@ -223,9 +236,10 @@ class PersistentCore:
         return result
 
     async def _save_state(self):
-        os.makedirs("./data", exist_ok=True)
         state = self.get_state_snapshot()
-        state_path = self.config.get("core_state_path", "./data/core_state.json")
+        data_dir = _runtime_data_dir(self.config)
+        state_path = self.config.get("core_state_path", os.path.join(data_dir, "core_state.json"))
+        os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
         state["journal_sequence"] = self.journal.last_sequence
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -233,7 +247,8 @@ class PersistentCore:
 
     def _restore_state(self):
         """Restore metrics from snapshot, then replay journal events after snapshot."""
-        state_path = self.config.get("core_state_path", "./data/core_state.json")
+        data_dir = _runtime_data_dir(self.config)
+        state_path = self.config.get("core_state_path", os.path.join(data_dir, "core_state.json"))
         snapshot_sequence = 0
         restored = False
 
@@ -289,9 +304,25 @@ class PersistentCore:
                             self.goals._goals[goal_id] = self.goals._goals.pop(old_id)
                             self.goals._goals[goal_id].id = goal_id
                 elif event.type == "interaction_received":
+                    self.metrics.total_interactions += 1
+                    self.metrics.last_interaction = event.timestamp or self.metrics.last_interaction
                     concepts = event.payload.get("concepts", [])
                     for c in concepts:
                         self.salience[c] = min(1.0, self.salience.get(c, 0) + 0.15)
+                elif event.type == "goal_progress_updated":
+                    goal_id = event.payload.get("goal_id")
+                    if goal_id:
+                        self.goals.update_progress(
+                            goal_id,
+                            float(event.payload.get("progress", 0.0)),
+                            str(event.payload.get("notes", "")),
+                        )
+                elif event.type == "goal_completed":
+                    goal_id = event.payload.get("goal_id")
+                    if goal_id:
+                        self.goals.complete(goal_id, str(event.payload.get("notes", "")))
+                elif event.type == "consolidation_ran":
+                    self.metrics.consolidation_cycles += 1
                 events_replayed += 1
         except Exception as e:
             logger.warning(f"Journal replay failed: {e}")
