@@ -40,6 +40,11 @@ Implemented behavior:
   lessons learned are persisted as separate layers.
 - Project archive/restore includes project memory, participant lanes, seat
   bindings, toolbox entries, lessons, and archive metadata.
+- `scripts/smoke_mystro_table_sync.py` performs an optional live Mystro Table
+  integration smoke against `127.0.0.1:8787`, installed PNP on `127.0.0.1:8000`,
+  and Ollama `qwen2.5-coder:7b`, including multi-seat participant binding,
+  model-backed chat, seat-move continuity, replacement-seat isolation, toolbox,
+  lessons, archive/restore, and a restart verification mode.
 - The process supervisor can restart a crashed child process and use `GET /` as
   a health probe.
 - `install.ps1` installs the app into a per-user standalone layout with copied

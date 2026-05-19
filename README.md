@@ -130,6 +130,24 @@ separate from participant state:
 - Project archive/restore includes project memory, participant lanes, seat
   bindings, toolbox entries, lessons, and archive metadata.
 
+## Live Mystro Table Smoke
+
+When `C:\Users\Jae\Desktop\mystro-table` is running and Ollama has
+`qwen2.5-coder:7b` installed, this repo includes a live end-to-end smoke that
+loads Mystro participant seats, binds those seats to PNP participant identities,
+runs Qwen-backed PNP chat, checks seat-move continuity, checks replacement-seat
+isolation, records a project toolbox tool and lesson, archives/restores the
+project, and can re-check continuity after a PNP restart:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke_mystro_table_sync.py
+.\.venv\Scripts\python.exe scripts\smoke_mystro_table_sync.py --verify-existing
+```
+
+The smoke writes its evidence to `.smoke\mystro_table_sync\result.json`. It is
+optional and specific to a local Mystro Table + Ollama setup; PNP itself remains
+provider-neutral and can use any configured provider/runtime.
+
 ## Run From Source
 
 ```powershell
