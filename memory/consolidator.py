@@ -1,74 +1,60 @@
 """
 memory/consolidator.py
 
-The Consolidator — background process that compresses episodic memory
-into semantic memory during idle periods.
-
-This is the system's equivalent of sleep consolidation in biological
-brains: taking the raw events of experience and extracting durable
-knowledge from them.
+The consolidator compresses low-salience episodic memory into stable semantic
+facts during idle periods.
 """
+
+from __future__ import annotations
 
 import logging
 import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from memory.warm import EpisodicMemory, Episode
+    from memory.warm import Episode, EpisodicMemory
 
 logger = logging.getLogger(__name__)
 
 
 class Consolidator:
-    """
-    Runs during idle periods to:
-    1. Decay old episodic memories
-    2. Extract semantic facts from low-salience episodes
-    3. Mark consolidated episodes
-    4. Prune fully-decayed episodes
-
-    In production: this would call an LLM to extract facts from episodes.
-    Here: rule-based extraction as a placeholder.
-    """
+    """Runs memory decay and rule-based fact extraction."""
 
     def __init__(self, episodic_memory: "EpisodicMemory", config: dict):
         self.episodic = episodic_memory
         self.config = config
         self._last_run: float = 0
 
-        # Lazy import to avoid circular dependency
         from memory.cold import SemanticMemory
-        self.semantic = SemanticMemory(config.get("semantic_db_path", "./data/semantic.db"))
+
+        self.semantic = SemanticMemory(
+            config.get("semantic_db_path", "./data/semantic.db"),
+            embedding_dimensions=int(config.get("embedding_dimensions", 128)),
+        )
 
     async def run_cycle(self, current_salience: dict[str, float]):
-        """
-        Run one consolidation cycle.
-        Called when the system has been idle long enough.
-        """
         cycle_start = time.time()
         logger.info("Consolidation cycle starting.")
 
-        # Step 1: Decay episodic salience
         self.episodic.run_decay()
+        candidates = self.episodic.get_consolidation_candidates(
+            limit=int(self.config.get("consolidation_batch_size", 20))
+        )
+        logger.info("Found %s episodes for consolidation.", len(candidates))
 
-        # Step 2: Get consolidation candidates
-        candidates = self.episodic.get_consolidation_candidates(limit=20)
-        logger.info(f"Found {len(candidates)} episodes for consolidation.")
-
-        # Step 3: Extract semantic facts
         consolidated_ids = []
+        facts_written = 0
         for episode in candidates:
-            facts = self._extract_facts(episode)
-            for fact_content, domain, confidence in facts:
+            for fact_content, domain, confidence in self._extract_facts(episode):
                 self.semantic.store_fact(
                     content=fact_content,
                     source_episode_ids=[episode.id],
                     domain=domain,
                     confidence=confidence,
                 )
+                facts_written += 1
             consolidated_ids.append(episode.id)
 
-        # Step 4: Mark as consolidated
         if consolidated_ids:
             self.episodic.mark_consolidated(consolidated_ids)
 
@@ -76,43 +62,34 @@ class Consolidator:
         self._last_run = time.time()
 
         logger.info(
-            f"Consolidation cycle complete: {len(consolidated_ids)} episodes consolidated "
-            f"in {duration:.2f}s."
+            "Consolidation cycle complete: %s episodes consolidated in %.2fs.",
+            len(consolidated_ids),
+            duration,
         )
 
         return {
             "episodes_consolidated": len(consolidated_ids),
+            "semantic_facts_written": facts_written,
             "duration_seconds": round(duration, 2),
         }
 
     def _extract_facts(self, episode: "Episode") -> list[tuple[str, str, float]]:
-        """
-        Extract semantic facts from an episode.
-
-        Returns list of (fact_content, domain, confidence) tuples.
-
-        Production: call LLM with episode content, ask it to extract
-        durable facts. Here: simple heuristic extraction.
-        """
         facts = []
 
-        # Heuristic: episodes tagged with "preference" → user_preferences domain
         if "preference" in episode.tags or "like" in episode.tags:
             facts.append((
                 f"User preference noted: {episode.summary}",
                 "user_preferences",
-                0.6 + (episode.reinforcement_count * 0.05),
+                min(1.0, 0.6 + (episode.reinforcement_count * 0.05)),
             ))
 
-        # Heuristic: episodes tagged with "fact" or "knowledge"
         if "fact" in episode.tags or "knowledge" in episode.tags:
             facts.append((
                 episode.summary,
                 "world_knowledge",
-                0.5 + (episode.reinforcement_count * 0.05),
+                min(1.0, 0.5 + (episode.reinforcement_count * 0.05)),
             ))
 
-        # Heuristic: high-valence episodes → self_knowledge
         if abs(episode.valence) > 0.6:
             valence_label = "positive" if episode.valence > 0 else "negative"
             facts.append((
@@ -121,13 +98,8 @@ class Consolidator:
                 0.4,
             ))
 
-        # Default: store summary as general knowledge if no other tags match
         if not facts and len(episode.summary) > 20:
-            facts.append((
-                episode.summary,
-                "general",
-                0.3,
-            ))
+            facts.append((episode.summary, "general", 0.3))
 
         return facts
 

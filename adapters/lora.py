@@ -1,36 +1,30 @@
 """
 adapters/lora.py
 
-Experience Adapter Layer — the mechanism for continuous learning
-without catastrophic forgetting.
+Experience adapter layer for PNP.
 
-The insight: don't modify base weights. Add a small trainable adapter
-on top of frozen base weights. The adapter accumulates experience.
-The base stays stable. Together they form "you".
-
-This is inspired by LoRA (Low-Rank Adaptation) but designed for
-continuous online updates rather than one-shot fine-tuning.
-
-Architecture:
-    output = base_model(input) + adapter(input)
-
-The adapter is small (<<1% of base params), fast to update,
-and can be checkpointed/rolled back independently.
+The adapter keeps structured deltas, trains a persisted low-rank additive model
+over local text embeddings, and uses that learned signal to select adaptation
+context for inference. It does not claim to modify private external LLM weights.
 """
 
-import json
-import time
-import os
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Optional
+import json
 import logging
+import os
+import time
+from typing import Optional
+
+from adapters.low_rank import LowRankAdapterModel
+from memory.embedding import HashingTextEmbedder, cosine_similarity
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class AdapterCheckpoint:
-    """A saved state of the adapter."""
     id: str
     timestamp: float
     update_count: int
@@ -40,16 +34,12 @@ class AdapterCheckpoint:
 
 @dataclass
 class ExperienceDelta:
-    """
-    A learning signal extracted from an interaction.
+    """A learning signal extracted from an interaction."""
 
-    In production: gradient updates computed from feedback.
-    Here: structured representation of what was learned.
-    """
-    content: str              # What was experienced
-    feedback: float           # -1.0 to 1.0 (negative to positive feedback)
-    domain: str               # What domain this applies to
-    confidence: float         # How confident we are in this learning signal
+    content: str
+    feedback: float
+    domain: str
+    confidence: float
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
@@ -73,131 +63,113 @@ class ExperienceDelta:
 
 
 class ExperienceAdapter:
-    """
-    Manages the experience adapter layer.
-
-    Key properties:
-    - Additive: base model behavior is preserved
-    - Incremental: updates happen online, not in batches
-    - Reversible: checkpoints allow rollback if drift detected
-    - Identity-anchored: constitutional invariants constrain updates
-    """
+    """Manages structured deltas plus a trainable low-rank adapter model."""
 
     MAX_DELTAS_IN_MEMORY = 1000
-    CHECKPOINT_INTERVAL = 100  # Checkpoint every N updates
+    CHECKPOINT_INTERVAL = 100
 
-    def __init__(self, base_model_id: str, config: dict):
-        self.base_model_id = base_model_id
+    def __init__(self, model_id: str, config: dict):
+        self.model_id = model_id
         self.config = config
         self.adapter_path = config.get("adapter_path", "./data/adapter")
         os.makedirs(self.adapter_path, exist_ok=True)
+
         self.MAX_DELTAS_IN_MEMORY = int(config.get("adapter_max_deltas_in_memory", self.MAX_DELTAS_IN_MEMORY))
         self.CHECKPOINT_INTERVAL = int(config.get("adapter_checkpoint_interval", self.CHECKPOINT_INTERVAL))
+        self.embedding_dimensions = int(config.get("embedding_dimensions", 128))
+        self.embedder = HashingTextEmbedder(self.embedding_dimensions)
+        self.model_path = os.path.join(self.adapter_path, "low_rank_adapter.json")
+        self.model = self._load_or_create_model()
 
         self._deltas: list[ExperienceDelta] = []
         self._update_count: int = 0
         self._checkpoints: list[AdapterCheckpoint] = []
-
-        # Domain-specific adaptation weights
-        # Higher = this domain has been more heavily adapted
         self._domain_weights: dict[str, float] = {}
+        self._last_training_metrics: Optional[dict] = None
+        self._last_trained_at: Optional[float] = None
 
         self._load_state()
-        logger.info(f"ExperienceAdapter initialized. {self._update_count} prior updates.")
+        logger.info("ExperienceAdapter initialized. %s prior updates.", self._update_count)
 
     def apply_delta(self, delta: ExperienceDelta, invariant_check: bool = True):
-        """
-        Apply a learning delta to the adapter.
-
-        In production: compute gradient update, apply to adapter weights.
-        Here: accumulate structured deltas for future batch training.
-        """
         from adapters.invariant import ConstitutionalInvariant
 
         if invariant_check:
-            # Check against constitutional invariants before applying
             invariant = ConstitutionalInvariant()
             if not invariant.allows_update(delta):
-                logger.warning(
-                    f"Adapter update blocked by invariant layer: {delta.content[:50]}..."
-                )
+                logger.warning("Adapter update blocked by invariant layer: %s...", delta.content[:50])
                 return False
 
         self._deltas.append(delta)
         self._update_count += 1
-
-        # Track domain adaptation
         self._domain_weights[delta.domain] = (
             self._domain_weights.get(delta.domain, 0.0) + abs(delta.feedback) * delta.confidence
         )
 
-        # Evict oldest deltas if over limit
         if len(self._deltas) > self.MAX_DELTAS_IN_MEMORY:
             self._deltas = self._deltas[-self.MAX_DELTAS_IN_MEMORY:]
 
-        # Periodic checkpointing
+        if self._should_auto_train():
+            self.train_adapter()
+
         if self._update_count % self.CHECKPOINT_INTERVAL == 0:
             self._checkpoint()
 
         self._save_state()
         return True
 
+    def train_adapter(self, epochs: Optional[int] = None) -> dict:
+        samples = self._training_samples()
+        epochs = int(epochs or self.config.get("adapter_training_epochs", 80))
+        learning_rate = float(self.config.get("adapter_learning_rate", 0.05))
+        metrics = self.model.train(samples, epochs=epochs, learning_rate=learning_rate)
+        self.model.save(self.model_path)
+        self._last_training_metrics = metrics.to_dict()
+        self._last_trained_at = time.time()
+        self._save_state()
+        return self._last_training_metrics
+
+    def score_text(self, text: str) -> float:
+        return self.model.predict(self.embedder.embed(text))
+
     def get_adaptation_context(self, query: str, domain: Optional[str] = None) -> str:
-        """
-        Return relevant adaptation context for an inference call.
+        query_embedding = self.embedder.embed(query)
+        scored: list[tuple[float, ExperienceDelta]] = []
 
-        This is how the adapter influences inference: by injecting
-        learned patterns into the context, even without actual weight updates.
-        """
-        query_lower = query.lower().strip()
-        terms = {
-            token
-            for token in query_lower.replace("?", " ").replace(".", " ").split()
-            if len(token) > 2
-        }
-
-        scored: list[tuple[int, ExperienceDelta]] = []
         for delta in self._deltas:
             if domain is not None and delta.domain != domain:
                 continue
             if delta.feedback <= 0.1:
                 continue
 
-            content_lower = delta.content.lower()
-            score = 0
-            if query_lower and query_lower in content_lower:
-                score += 4
-            score += sum(1 for term in terms if term in content_lower)
-            if score > 0 or not query_lower:
-                scored.append((score, delta))
+            delta_embedding = self.embedder.embed(self._delta_text(delta))
+            similarity = cosine_similarity(query_embedding, delta_embedding) if query.strip() else 1.0
+            adapter_score = self.score_text(delta.content)
+            if similarity <= 0 and adapter_score <= 0:
+                continue
+
+            score = (similarity * 0.55) + (adapter_score * 0.25) + (delta.confidence * 0.20)
+            scored.append((score, delta))
 
         if not scored:
             return ""
 
-        # Sort by recency and confidence
-        scored.sort(key=lambda item: (item[0], item[1].timestamp * item[1].confidence), reverse=True)
+        scored.sort(key=lambda item: (item[0], item[1].timestamp), reverse=True)
         top_deltas = [delta for _, delta in scored[:5]]
 
         parts = ["=== LEARNED ADAPTATIONS ==="]
         for delta in top_deltas:
-            parts.append(f"[domain:{delta.domain}] {delta.content}")
+            score = self.score_text(delta.content)
+            parts.append(f"[domain:{delta.domain} score:{score:.3f}] {delta.content}")
         parts.append("=== END ADAPTATIONS ===")
-
         return "\n".join(parts)
 
     def detect_drift(self) -> Optional[dict]:
-        """
-        Detect if the adapter has drifted from its constitutional anchors.
-
-        Returns drift report if drift detected, None if stable.
-        """
         if len(self._deltas) < 10:
             return None
 
         recent = self._deltas[-20:]
-        avg_feedback = sum(d.feedback for d in recent) / len(recent)
-
-        # Check for systematic negative feedback — may indicate value drift
+        avg_feedback = sum(delta.feedback for delta in recent) / len(recent)
         if avg_feedback < -0.3:
             return {
                 "drift_type": "negative_feedback_trend",
@@ -205,10 +177,9 @@ class ExperienceAdapter:
                 "recommendation": "review_recent_updates",
             }
 
-        # Check for domain over-specialization
         max_domain_weight = max(self._domain_weights.values(), default=0)
         total_weight = sum(self._domain_weights.values()) + 0.001
-        if max_domain_weight / total_weight > 0.8:
+        if max_domain_weight / total_weight > 0.8 and len(self._domain_weights) > 1:
             dominant_domain = max(self._domain_weights, key=self._domain_weights.get)
             return {
                 "drift_type": "domain_overspecialization",
@@ -219,8 +190,36 @@ class ExperienceAdapter:
 
         return None
 
+    def _training_samples(self) -> list[tuple[list[float], float, float]]:
+        samples = []
+        for delta in self._deltas:
+            vector = self.embedder.embed(self._delta_text(delta))
+            target = max(-1.0, min(1.0, delta.feedback * delta.confidence))
+            weight = max(0.05, min(1.0, delta.confidence))
+            samples.append((vector, target, weight))
+        return samples
+
+    def _should_auto_train(self) -> bool:
+        if not bool(self.config.get("adapter_auto_train", True)):
+            return False
+        min_deltas = int(self.config.get("adapter_train_min_deltas", 1))
+        interval = int(self.config.get("adapter_train_interval", 1))
+        return len(self._deltas) >= min_deltas and self._update_count % interval == 0
+
+    def _delta_text(self, delta: ExperienceDelta) -> str:
+        return f"{delta.domain} {delta.content}"
+
+    def _load_or_create_model(self) -> LowRankAdapterModel:
+        if os.path.exists(self.model_path):
+            return LowRankAdapterModel.load(self.model_path)
+        return LowRankAdapterModel(
+            dimensions=self.embedding_dimensions,
+            rank=int(self.config.get("adapter_rank", 8)),
+            alpha=float(self.config.get("adapter_alpha", 8.0)),
+            seed=str(self.config.get("adapter_seed", "pnp")),
+        )
+
     def _checkpoint(self):
-        """Save a checkpoint of current adapter state."""
         checkpoint_id = f"ckpt_{self._update_count}_{int(time.time())}"
         checkpoint_path = os.path.join(self.adapter_path, f"{checkpoint_id}.json")
 
@@ -231,45 +230,56 @@ class ExperienceAdapter:
             metadata={
                 "domain_weights": self._domain_weights,
                 "delta_count": len(self._deltas),
+                "low_rank_adapter": self.model.metadata(),
             },
             path=checkpoint_path,
         )
 
-        with open(checkpoint_path, "w") as f:
+        with open(checkpoint_path, "w", encoding="utf-8") as f:
             json.dump({
                 "id": checkpoint.id,
                 "timestamp": checkpoint.timestamp,
                 "update_count": checkpoint.update_count,
                 "domain_weights": self._domain_weights,
-                "recent_deltas": [d.to_dict() for d in self._deltas[-10:]],
+                "recent_deltas": [delta.to_dict() for delta in self._deltas[-10:]],
+                "low_rank_adapter": self.model.metadata(),
             }, f, indent=2)
 
         self._checkpoints.append(checkpoint)
-        logger.info(f"Adapter checkpoint saved: {checkpoint_id}")
+        logger.info("Adapter checkpoint saved: %s", checkpoint_id)
 
     def _save_state(self):
         state_path = os.path.join(self.adapter_path, "state.json")
-        with open(state_path, "w") as f:
+        with open(state_path, "w", encoding="utf-8") as f:
             json.dump({
-                "schema_version": 1,
-                "base_model_id": self.base_model_id,
+                "schema_version": 2,
+                "model_id": self.model_id,
                 "update_count": self._update_count,
                 "domain_weights": self._domain_weights,
                 "delta_count": len(self._deltas),
-                "deltas": [d.to_dict() for d in self._deltas[-self.MAX_DELTAS_IN_MEMORY:]],
+                "deltas": [delta.to_dict() for delta in self._deltas[-self.MAX_DELTAS_IN_MEMORY:]],
+                "low_rank_adapter": self.model.metadata(),
+                "model_path": self.model_path,
+                "last_training_metrics": self._last_training_metrics,
+                "last_trained_at": self._last_trained_at,
             }, f, indent=2)
 
     def _load_state(self):
         state_path = os.path.join(self.adapter_path, "state.json")
-        if os.path.exists(state_path):
-            with open(state_path) as f:
-                state = json.load(f)
-            self._update_count = state.get("update_count", 0)
-            self._domain_weights = state.get("domain_weights", {})
-            self._deltas = [
-                ExperienceDelta.from_dict(raw)
-                for raw in state.get("deltas", [])
-            ][-self.MAX_DELTAS_IN_MEMORY:]
+        if not os.path.exists(state_path):
+            return
+
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+
+        self._update_count = int(state.get("update_count", 0))
+        self._domain_weights = dict(state.get("domain_weights", {}))
+        self._deltas = [
+            ExperienceDelta.from_dict(raw)
+            for raw in state.get("deltas", [])
+        ][-self.MAX_DELTAS_IN_MEMORY:]
+        self._last_training_metrics = state.get("last_training_metrics")
+        self._last_trained_at = state.get("last_trained_at")
 
     def stats(self) -> dict:
         return {
@@ -278,4 +288,7 @@ class ExperienceAdapter:
             "checkpoints": len(self._checkpoints),
             "domain_weights": self._domain_weights,
             "drift_status": self.detect_drift(),
+            "low_rank_adapter": self.model.metadata(),
+            "last_training_metrics": self._last_training_metrics,
+            "last_trained_at": self._last_trained_at,
         }

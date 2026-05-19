@@ -23,7 +23,7 @@ def main() -> int:
     runtime_dir.mkdir(parents=True)
 
     config = {
-        "base_model": "mock-model",
+        "model_id": "mock-model",
         "data_dir": str(runtime_dir),
         "working_memory_capacity": 2048,
         "episodic_db_path": str(runtime_dir / "episodic.db"),
@@ -89,6 +89,10 @@ def main() -> int:
         )
         result["checks"].append(["POST /feedback with token", feedback.status_code])
 
+        train = client.post("/adapter/train", json={"epochs": 5}, headers=headers)
+        result["checks"].append(["POST /adapter/train with token", train.status_code])
+        result["adapter_train"] = train.json()["metrics"]
+
         chat = client.post(
             "/chat",
             json={"message": "remember concise notes", "concepts": ["concise"]},
@@ -106,6 +110,11 @@ def main() -> int:
 
         adapter_stats = client.get("/adapter/stats")
         result["checks"].append(["GET /adapter/stats", adapter_stats.status_code])
+        result["adapter_stats"] = adapter_stats.json()
+
+        semantic_stats = client.get("/memory/semantic")
+        result["checks"].append(["GET /memory/semantic", semantic_stats.status_code])
+        result["semantic_stats"] = semantic_stats.json()
 
     journal_path = runtime_dir / "events.jsonl"
     event_types = [

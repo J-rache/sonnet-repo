@@ -29,7 +29,7 @@ class InferenceRequest:
     system_prompt_override: Optional[str] = None
     stream: bool = True
     max_tokens: int = 2048
-    model: str = "claude-sonnet-4-20250514"
+    model: str = "mock-model"
 
 
 @dataclass

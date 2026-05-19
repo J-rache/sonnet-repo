@@ -11,7 +11,7 @@ TOKEN = "test-local-token"
 def write_config(tmp_path: Path) -> Path:
     data_dir = tmp_path / "runtime"
     config = {
-        "base_model": "mock-model",
+        "model_id": "mock-model",
         "data_dir": str(data_dir),
         "working_memory_capacity": 2048,
         "episodic_db_path": str(data_dir / "episodic.db"),

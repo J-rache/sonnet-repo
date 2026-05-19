@@ -1,7 +1,17 @@
 # PNP Default Configuration
 
-# Model
-base_model: "claude-sonnet-4-20250514"
+# Model/provider
+model_id: "mock-model"
+inference_provider: "mock"
+
+providers:
+  anthropic:
+    api_key_env: "ANTHROPIC_API_KEY"
+  openai_compatible:
+    api_base: "http://127.0.0.1:8001/v1"
+    api_key_env: "OPENAI_API_KEY"
+  ollama:
+    api_base: "http://127.0.0.1:11434"
 
 # Core process
 heartbeat_interval_ms: 100
@@ -10,6 +20,7 @@ consolidation_idle_threshold_seconds: 30
 # Memory
 data_dir: "./data"
 working_memory_capacity: 8192
+embedding_dimensions: 128
 episodic_db_path: "./data/episodic.db"
 semantic_db_path: "./data/semantic.db"
 adapter_path: "./data/adapter"
@@ -24,6 +35,14 @@ episodic_consolidation_threshold: 0.1
 # Adapter
 adapter_checkpoint_interval: 100
 adapter_max_deltas_in_memory: 1000
+adapter_rank: 8
+adapter_alpha: 8.0
+adapter_learning_rate: 0.05
+adapter_training_epochs: 80
+adapter_auto_train: true
+adapter_train_min_deltas: 1
+adapter_train_interval: 1
+adapter_seed: "pnp"
 
 # API
 api_host: "127.0.0.1"
@@ -31,4 +50,3 @@ api_port: 8000
 api_log_level: "info"
 local_api_token_env: "PNP_LOCAL_TOKEN"
 local_api_token: "dev-local-token-change-me"
-inference_provider: "anthropic"

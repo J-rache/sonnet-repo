@@ -39,7 +39,7 @@ async def startup_runtime():
 
     _core = PersistentCore(_config)
     _adapter = ExperienceAdapter(
-        base_model_id=_config.get("base_model", "claude-sonnet-4-20250514"),
+        model_id=resolve_model_id(_config),
         config=_config,
     )
 
@@ -95,13 +95,17 @@ def load_config() -> dict:
         config = yaml.safe_load(f) or {}
     config.setdefault("api_host", "127.0.0.1")
     config.setdefault("local_api_token_env", "PNP_LOCAL_TOKEN")
-    config.setdefault("inference_provider", "anthropic")
+    config.setdefault("inference_provider", "mock")
     return config
 
 
 def resolve_local_token(config: dict) -> Optional[str]:
     env_name = config.get("local_api_token_env", "PNP_LOCAL_TOKEN")
     return os.getenv(env_name) or config.get("local_api_token")
+
+
+def resolve_model_id(config: dict) -> str:
+    return os.getenv("PNP_MODEL_ID") or config.get("model_id") or "mock-model"
 
 
 async def require_local_token(x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token")):
@@ -128,6 +132,10 @@ class FeedbackRequest(BaseModel):
     feedback: float
     domain: str = "general"
     confidence: float = 0.5
+
+
+class AdapterTrainRequest(BaseModel):
+    epochs: Optional[int] = None
 
 
 @app.get("/")
@@ -182,7 +190,7 @@ async def chat(request: ChatRequest, _auth: None = Depends(require_local_token))
         adaptation_context=adaptation_context,
         core_state=core_state,
         stream=request.stream,
-        model=_config.get("base_model", "claude-sonnet-4-20250514"),
+        model=resolve_model_id(_config),
     )
 
     result = await run_configured_inference(inference_req)
@@ -260,27 +268,9 @@ def build_semantic_context(query: str) -> str:
 
 
 async def run_configured_inference(inference_req):
-    provider = os.getenv("PNP_INFERENCE_PROVIDER") or _config.get("inference_provider", "anthropic")
-    if provider == "mock":
-        from inference.engine import InferenceResult, extract_memory_deltas
+    from inference.providers import run_provider_inference
 
-        t_start = time.monotonic()
-        content = f"Mock inference response: received '{inference_req.user_input[:120]}'"
-        return InferenceResult(
-            content=content,
-            tokens_used=max(1, len(content) // 4),
-            latency_ms=(time.monotonic() - t_start) * 1000,
-            memory_deltas=extract_memory_deltas(inference_req.user_input, content),
-            suggested_goals=[],
-            valence=0.0,
-            metadata={"provider": "mock"},
-        )
-
-    import anthropic
-    from inference.engine import run_inference
-
-    client = anthropic.AsyncAnthropic()
-    return await run_inference(inference_req, client)
+    return await run_provider_inference(inference_req, _config)
 
 
 @app.post("/goals")
@@ -324,6 +314,13 @@ async def recent_memory(hours: float = 24):
     }
 
 
+@app.get("/memory/semantic")
+async def semantic_memory_stats():
+    if not _core:
+        raise HTTPException(503, "Core not initialized")
+    return _core.consolidator.semantic.stats()
+
+
 @app.post("/feedback")
 async def apply_feedback(request: FeedbackRequest, _auth: None = Depends(require_local_token)):
     if not _adapter:
@@ -344,6 +341,21 @@ async def apply_feedback(request: FeedbackRequest, _auth: None = Depends(require
     return {
         "applied": allowed,
         "blocked_by_invariant": not allowed,
+        "adapter_stats": _adapter.stats(),
+    }
+
+
+@app.post("/adapter/train")
+async def train_adapter(request: AdapterTrainRequest, _auth: None = Depends(require_local_token)):
+    if not _adapter:
+        raise HTTPException(503, "Adapter not initialized")
+
+    metrics = _adapter.train_adapter(epochs=request.epochs)
+    if _core:
+        _core.record_event("adapter_trained", metrics)
+    return {
+        "trained": True,
+        "metrics": metrics,
         "adapter_stats": _adapter.stats(),
     }
 

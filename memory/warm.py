@@ -1,22 +1,22 @@
 """
 memory/warm.py
 
-Episodic Memory — the autobiographical record of what has happened.
-
-Events are stored with timestamps, semantic tags, and emotional valence.
-They decay over time unless reinforced. The consolidator periodically
-compresses episodic memory into semantic (cold) memory.
-
-This is the layer that gives the system a sense of personal history.
+Episodic memory stores the autobiographical event record. Episodes are
+timestamped, tagged, salience-ranked, and retrievable through local vector
+similarity.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+import os
 import sqlite3
 import time
-import json
-import uuid
-from dataclasses import dataclass
 from typing import Optional
-import os
+import uuid
+
+from memory.embedding import HashingTextEmbedder, cosine_similarity, vector_from_json, vector_to_json
 
 
 @dataclass
@@ -24,12 +24,14 @@ class Episode:
     content: str
     summary: str
     tags: list[str]
-    valence: float          # -1.0 (negative) to 1.0 (positive)
-    salience: float         # 0.0 to 1.0
+    valence: float
+    salience: float
     timestamp: float
     id: str
     consolidated: bool = False
     reinforcement_count: int = 0
+    retrieval_score: float = 0.0
+    embedding: list[float] = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -42,29 +44,22 @@ class Episode:
             "age_hours": round((time.time() - self.timestamp) / 3600, 1),
             "reinforcement_count": self.reinforcement_count,
             "consolidated": self.consolidated,
+            "retrieval_score": round(self.retrieval_score, 4),
         }
 
 
 class EpisodicMemory:
-    """
-    SQLite-backed episodic memory store.
+    """SQLite-backed episodic memory store with persisted embeddings."""
 
-    Episodes are time-stamped events that represent meaningful interactions,
-    realizations, or state changes. They form the 'autobiography' of the
-    persistent process.
+    DECAY_RATE_PER_HOUR = 0.02
+    CONSOLIDATION_THRESHOLD = 0.1
 
-    Decay: salience decreases with time unless reinforced by:
-    - Being recalled in response to a query
-    - Being tagged as high-salience during consolidation
-    - Being referenced in a new interaction
-    """
-
-    DECAY_RATE_PER_HOUR = 0.02    # Salience decay per hour
-    CONSOLIDATION_THRESHOLD = 0.1  # Below this salience, eligible for consolidation
-
-    def __init__(self, db_path: str = "./data/episodic.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    def __init__(self, db_path: str = "./data/episodic.db", embedding_dimensions: int = 128):
+        directory = os.path.dirname(db_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         self.db_path = db_path
+        self.embedder = HashingTextEmbedder(embedding_dimensions)
         self._init_db()
 
     def _init_db(self):
@@ -83,16 +78,29 @@ class EpisodicMemory:
                     created_at REAL DEFAULT (unixepoch())
                 )
             """)
+            self._ensure_column(conn, "episodes", "embedding", "TEXT")
+            self._ensure_column(conn, "episodes", "embedding_model", "TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON episodes(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_salience ON episodes(salience)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_consolidated ON episodes(consolidated)")
 
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
     def _conn(self):
         return sqlite3.connect(self.db_path)
 
-    def store(self, content: str, summary: str, tags: list[str],
-              valence: float = 0.0, salience: float = 1.0) -> Episode:
-        """Store a new episode."""
+    def store(
+        self,
+        content: str,
+        summary: str,
+        tags: list[str],
+        valence: float = 0.0,
+        salience: float = 1.0,
+    ) -> Episode:
+        embedding = self.embedder.embed(self._embedding_text(content, summary, tags))
         episode = Episode(
             id=str(uuid.uuid4())[:12],
             content=content,
@@ -101,11 +109,15 @@ class EpisodicMemory:
             valence=valence,
             salience=salience,
             timestamp=time.time(),
+            embedding=embedding,
         )
         with self._conn() as conn:
             conn.execute("""
-                INSERT INTO episodes (id, content, summary, tags, valence, salience, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO episodes (
+                    id, content, summary, tags, valence, salience, timestamp,
+                    embedding, embedding_model
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 episode.id,
                 episode.content,
@@ -114,43 +126,55 @@ class EpisodicMemory:
                 episode.valence,
                 episode.salience,
                 episode.timestamp,
+                vector_to_json(embedding),
+                self.embedder.model_id,
             ))
         return episode
 
     def recall(self, query: str, limit: int = 5, min_salience: float = 0.1) -> list[Episode]:
-        """
-        Retrieve episodes relevant to a query.
-        (Production: use vector similarity. Here: tag/keyword matching.)
-        """
+        """Retrieve episodes by vector similarity, salience, and recency."""
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT id, content, summary, tags, valence, salience, timestamp,
-                       consolidated, reinforcement_count
+                       consolidated, reinforcement_count, embedding
                 FROM episodes
                 WHERE salience >= ? AND consolidated = 0
                 ORDER BY salience DESC, timestamp DESC
                 LIMIT ?
-            """, (min_salience, limit * 3)).fetchall()
+            """, (min_salience, max(limit * 10, 25))).fetchall()
 
-        episodes = [self._row_to_episode(r) for r in rows]
+        episodes = [self._row_to_episode(row) for row in rows]
+        if not episodes:
+            return []
 
-        # Filter by relevance (simple keyword match — replace with embeddings)
-        query_lower = query.lower()
-        relevant = [
-            ep for ep in episodes
-            if query_lower in ep.content.lower()
-            or query_lower in ep.summary.lower()
-            or any(query_lower in tag for tag in ep.tags)
-        ]
+        query_embedding = self.embedder.embed(query)
+        now = time.time()
+        scored: list[Episode] = []
+        for episode in episodes:
+            if not episode.embedding:
+                episode.embedding = self.embedder.embed(
+                    self._embedding_text(episode.content, episode.summary, episode.tags)
+                )
+                self._persist_embedding(episode)
 
-        # Reinforce recalled episodes
-        for ep in relevant[:limit]:
-            self._reinforce(ep.id)
+            similarity = cosine_similarity(query_embedding, episode.embedding) if query.strip() else 1.0
+            if similarity <= 0 and query.strip():
+                continue
 
-        return relevant[:limit]
+            age_hours = max((now - episode.timestamp) / 3600, 0.0)
+            recency = 1 / (1 + age_hours)
+            episode.retrieval_score = (similarity * 0.65) + (episode.salience * 0.25) + (recency * 0.10)
+            scored.append(episode)
+
+        scored.sort(key=lambda episode: (episode.retrieval_score, episode.salience, episode.timestamp), reverse=True)
+        selected = scored[:limit]
+
+        for episode in selected:
+            self._reinforce(episode.id)
+
+        return selected
 
     def _reinforce(self, episode_id: str):
-        """Boost salience of a recalled episode."""
         with self._conn() as conn:
             conn.execute("""
                 UPDATE episodes
@@ -160,8 +184,6 @@ class EpisodicMemory:
             """, (episode_id,))
 
     def run_decay(self):
-        """Apply time-based salience decay to all episodes."""
-        # Decay proportional to hours since last decay check
         with self._conn() as conn:
             conn.execute("""
                 UPDATE episodes
@@ -170,38 +192,42 @@ class EpisodicMemory:
             """, (self.DECAY_RATE_PER_HOUR,))
 
     def get_consolidation_candidates(self, limit: int = 20) -> list[Episode]:
-        """Return low-salience episodes ready for consolidation."""
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT id, content, summary, tags, valence, salience, timestamp,
-                       consolidated, reinforcement_count
+                       consolidated, reinforcement_count, embedding
                 FROM episodes
                 WHERE salience < ? AND consolidated = 0
                 ORDER BY salience ASC
                 LIMIT ?
             """, (self.CONSOLIDATION_THRESHOLD, limit)).fetchall()
-        return [self._row_to_episode(r) for r in rows]
+        return [self._row_to_episode(row) for row in rows]
 
     def mark_consolidated(self, episode_ids: list[str]):
         with self._conn() as conn:
             conn.executemany(
                 "UPDATE episodes SET consolidated = 1 WHERE id = ?",
-                [(eid,) for eid in episode_ids]
+                [(episode_id,) for episode_id in episode_ids],
             )
 
     def recent(self, hours: float = 24, limit: int = 20) -> list[Episode]:
-        """Return recent episodes."""
         since = time.time() - (hours * 3600)
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT id, content, summary, tags, valence, salience, timestamp,
-                       consolidated, reinforcement_count
+                       consolidated, reinforcement_count, embedding
                 FROM episodes
                 WHERE timestamp >= ? AND consolidated = 0
                 ORDER BY timestamp DESC
                 LIMIT ?
             """, (since, limit)).fetchall()
-        return [self._row_to_episode(r) for r in rows]
+        return [self._row_to_episode(row) for row in rows]
+
+    def _persist_embedding(self, episode: Episode):
+        with self._conn() as conn:
+            conn.execute("""
+                UPDATE episodes SET embedding = ?, embedding_model = ? WHERE id = ?
+            """, (vector_to_json(episode.embedding), self.embedder.model_id, episode.id))
 
     def _row_to_episode(self, row) -> Episode:
         return Episode(
@@ -214,16 +240,25 @@ class EpisodicMemory:
             timestamp=row[6],
             consolidated=bool(row[7]),
             reinforcement_count=row[8],
+            embedding=vector_from_json(row[9]),
         )
+
+    def _embedding_text(self, content: str, summary: str, tags: list[str]) -> str:
+        return f"{' '.join(tags)} {summary} {content}"
 
     def stats(self) -> dict:
         with self._conn() as conn:
             total = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
             active = conn.execute("SELECT COUNT(*) FROM episodes WHERE consolidated = 0").fetchone()[0]
             avg_sal = conn.execute("SELECT AVG(salience) FROM episodes WHERE consolidated = 0").fetchone()[0]
+            embedded = conn.execute(
+                "SELECT COUNT(*) FROM episodes WHERE embedding IS NOT NULL AND embedding != ''"
+            ).fetchone()[0]
         return {
             "total_episodes": total,
             "active_episodes": active,
             "consolidated_episodes": total - active,
             "avg_salience": round(avg_sal or 0, 3),
+            "embedded_episodes": embedded,
+            "embedding": self.embedder.metadata(),
         }

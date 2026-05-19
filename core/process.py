@@ -75,8 +75,15 @@ class PersistentCore:
 
         self.state = MotivationalState()
         self.goals = GoalStack()
-        self.working_memory = WorkingMemory(capacity=config.get("working_memory_capacity", 8192))
-        self.episodic_memory = EpisodicMemory(config.get("episodic_db_path", os.path.join(self.data_dir, "episodic.db")))
+        embedding_dimensions = int(config.get("embedding_dimensions", 128))
+        self.working_memory = WorkingMemory(
+            capacity=config.get("working_memory_capacity", 8192),
+            embedding_dimensions=embedding_dimensions,
+        )
+        self.episodic_memory = EpisodicMemory(
+            config.get("episodic_db_path", os.path.join(self.data_dir, "episodic.db")),
+            embedding_dimensions=embedding_dimensions,
+        )
         self.consolidator = Consolidator(self.episodic_memory, config)
         self.salience: dict[str, float] = {}
 

@@ -1,18 +1,17 @@
 """
 memory/hot.py
 
-Working Memory — fast, volatile, token-limited.
-
-This is the current session's active context. It's what the inference
-engine sees directly. Unlike the frozen context window of a standard LLM,
-this is managed actively: older/lower-salience content gets evicted
-to make room for new content, rather than simply truncating.
+Working memory is the fast, volatile context buffer passed to inference. It is
+token-budgeted and salience-ranked.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+from __future__ import annotations
+
 from collections import deque
+from dataclasses import dataclass, field
 import time
+
+from memory.embedding import HashingTextEmbedder, cosine_similarity
 
 
 @dataclass
@@ -22,36 +21,33 @@ class MemoryEntry:
     timestamp: float = field(default_factory=time.time)
     salience: float = 1.0
     token_estimate: int = 0
+    embedding: list[float] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         if self.token_estimate == 0:
-            # Rough estimate: 1 token ≈ 4 chars
-            self.token_estimate = len(self.content) // 4
+            self.token_estimate = max(1, len(self.content) // 4)
 
     def decay(self, rate: float = 0.01):
-        """Reduce salience over time."""
         self.salience = max(0.0, self.salience * (1 - rate))
 
 
 class WorkingMemory:
-    """
-    Token-budget-managed working memory.
+    """Token-budget-managed working memory."""
 
-    Maintains a rolling window of recent context, evicting low-salience
-    entries when capacity is reached. Designed to be passed directly
-    to the inference engine as formatted context.
-    """
-
-    def __init__(self, capacity: int = 8192):
+    def __init__(self, capacity: int = 8192, embedding_dimensions: int = 128):
         self.capacity = capacity
+        self.embedder = HashingTextEmbedder(embedding_dimensions)
         self._entries: deque[MemoryEntry] = deque()
         self.current_tokens: int = 0
 
     def add(self, content: str, metadata: dict, salience: float = 1.0):
-        """Add a new entry, evicting old ones if over capacity."""
-        entry = MemoryEntry(content=content, metadata=metadata, salience=salience)
+        entry = MemoryEntry(
+            content=content,
+            metadata=metadata,
+            salience=salience,
+            embedding=self.embedder.embed(content),
+        )
 
-        # Evict until we have room
         while self.current_tokens + entry.token_estimate > self.capacity and self._entries:
             self._evict_lowest_salience()
 
@@ -59,37 +55,33 @@ class WorkingMemory:
         self.current_tokens += entry.token_estimate
 
     def _evict_lowest_salience(self):
-        """Remove the entry with lowest salience."""
         if not self._entries:
             return
-        min_entry = min(self._entries, key=lambda e: e.salience)
+        min_entry = min(self._entries, key=lambda entry: entry.salience)
         self._entries.remove(min_entry)
         self.current_tokens -= min_entry.token_estimate
 
     def boost_salience(self, query: str, boost: float = 0.2):
-        """
-        Boost salience of entries relevant to a query.
-        (In production: use embedding similarity. Here: substring match.)
-        """
-        query_lower = query.lower()
+        """Boost entries whose vectors are close to the query vector."""
+        query_embedding = self.embedder.embed(query)
         for entry in self._entries:
-            if query_lower in entry.content.lower():
-                entry.salience = min(1.0, entry.salience + boost)
+            if not entry.embedding:
+                entry.embedding = self.embedder.embed(entry.content)
+            similarity = cosine_similarity(query_embedding, entry.embedding)
+            if similarity > 0.15:
+                entry.salience = min(1.0, entry.salience + (boost * similarity))
 
     def decay_all(self, rate: float = 0.005):
-        """Decay all entries — called periodically by core."""
         for entry in self._entries:
             entry.decay(rate)
 
     def to_context_string(self) -> str:
-        """
-        Format working memory as a context string for the inference engine.
-        Most recent and most salient content appears first.
-        """
         sorted_entries = sorted(
             self._entries,
-            key=lambda e: (e.salience * 0.6 + (1 / (1 + time.time() - e.timestamp)) * 0.4),
-            reverse=True
+            key=lambda entry: (
+                entry.salience * 0.6 + (1 / (1 + time.time() - entry.timestamp)) * 0.4
+            ),
+            reverse=True,
         )
 
         parts = ["=== WORKING MEMORY ==="]
@@ -127,6 +119,7 @@ class WorkingMemory:
                 salience=float(raw.get("salience", 1.0)),
                 token_estimate=int(raw.get("token_estimate", 0)),
             )
+            entry.embedding = self.embedder.embed(entry.content)
             self._entries.append(entry)
             self.current_tokens += entry.token_estimate
 

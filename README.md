@@ -1,37 +1,46 @@
 # PNP - Persistent Neural Process
 
-PNP is a local prototype for an AI runtime with persistent process state,
-tiered memory, replayable continuity events, and an invariant-gated adaptation
-layer.
+PNP is a local runtime for an AI process with persistent core state, tiered
+memory, replayable continuity events, vector retrieval, and a trainable
+low-rank adaptation layer.
 
-This repo does not train real LoRA weights yet. The current adapter stores
-structured learning deltas and injects relevant positive deltas into inference
-context. The base model call is still external unless mock inference is enabled.
+The project is intentionally local-first. It can verify startup, memory,
+adapter training, API auth, restart replay, and watchdog behavior without a
+live model call. For real generation, set `inference_provider` and `model_id`
+for the provider you want.
 
 ## What Works Now
 
-- FastAPI app starts with the persistent core, episodic memory, semantic memory,
-  and experience adapter initialized.
+- FastAPI startup initializes the persistent core, episodic memory, semantic
+  memory, and experience adapter.
 - Runtime state changes are written to an append-only JSONL event journal.
-- Shutdown writes a core snapshot, and startup restores that snapshot plus
+- Shutdown writes a core snapshot, and startup restores the snapshot plus
   journal events that happened after the snapshot.
-- Adapter deltas are persisted in `adapter/state.json` and are available after
-  restart for adaptation context.
+- Working, episodic, and semantic memory use deterministic local vector
+  embeddings and cosine retrieval.
+- Adapter deltas are persisted in `adapter/state.json`.
+- Adapter feedback trains a persisted low-rank additive adapter model in
+  `adapter/low_rank_adapter.json`.
 - Chat inference receives working-memory, episodic, semantic, adapter, and core
   state context.
 - Mutating endpoints require a local API token.
 - The default API bind is `127.0.0.1`.
-- Tests and a smoke script can verify the API path with mock inference and no
-  live model call.
+- A watchdog supervisor can restart the local API process if it exits or fails
+  repeated health checks.
+- Tests and smoke scripts verify the API, continuity, vector retrieval, adapter
+  training, and supervisor paths without a live model call.
 
-## Current Limits
+## Boundaries
 
-- Semantic and episodic retrieval use simple keyword scoring, not embeddings.
-- Consolidation uses rule-based extraction, not an LLM extractor.
-- The adapter is a persisted delta/summarization layer, not live LoRA weight
-  training.
-- The persistent core runs while the API process is alive; this repo does not
-  include a service installer or watchdog daemon.
+- The low-rank adapter is real trainable local adapter math over PNP text
+  embeddings. It influences provider context and scoring; it does not modify
+  external provider weights.
+- The default embedder is deterministic and dependency-free. It is vector
+  retrieval, not transformer embedding quality.
+- Consolidation uses rule-based fact extraction. No separate LLM extractor is
+  called during tests or smokes.
+- `scripts/start_supervisor.ps1` runs a foreground watchdog. It is not a Windows
+  Service installer.
 - The default token in `config/default.yaml` is for local development. Set
   `PNP_LOCAL_TOKEN` for real local use.
 
@@ -40,7 +49,8 @@ context. The base model call is still external unless mock inference is enabled.
 ```text
 adapters/
   invariant.py       Constitutional update gate
-  lora.py            Persisted experience-delta adapter
+  lora.py            Experience delta store and adapter interface
+  low_rank.py        Trainable low-rank adapter math
 api/
   server.py          FastAPI app and local auth boundary
 config/
@@ -50,17 +60,22 @@ core/
   journal.py         Append-only JSONL continuity journal
   process.py         Persistent core loops, snapshot, and replay
   state.py           Motivational state vector
+daemon/
+  supervisor.py      Local watchdog supervisor
 docs/
   README.md          Runtime truth notes
 inference/
   engine.py          Context assembly and external model call
 memory/
+  embedding.py       Deterministic local text embeddings
   hot.py             Working memory
-  warm.py            SQLite episodic memory
-  cold.py            SQLite semantic memory
+  warm.py            SQLite episodic memory with vectors
+  cold.py            SQLite semantic memory with vectors
   consolidator.py    Rule-based memory consolidation
 scripts/
   smoke_api.py       No-live-model API smoke
+  smoke_supervisor.py
+  start_supervisor.ps1
 tests/
   test_api_smoke.py
   test_continuity.py
@@ -97,6 +112,7 @@ Read-only endpoints:
 - `GET /state`
 - `GET /goals`
 - `GET /memory/recent`
+- `GET /memory/semantic`
 - `GET /adapter/stats`
 - `GET /adapter/drift`
 
@@ -106,14 +122,31 @@ Mutating endpoints:
 - `POST /goals`
 - `DELETE /goals/{goal_id}`
 - `POST /feedback`
+- `POST /adapter/train`
+
+## Run With Watchdog
+
+```powershell
+$env:PNP_LOCAL_TOKEN = "replace-with-local-secret"
+.\scripts\start_supervisor.ps1
+```
+
+The supervisor starts `main.py`, checks `GET /`, and restarts the process after
+crashes or repeated health failures.
 
 ## Verify Without A Live Model
 
-The smoke script creates `.smoke/api-smoke/`, runs the API through FastAPI's
-test client, uses mock inference, and writes `.smoke/api-smoke/result.json`.
+The API smoke creates `.smoke/api-smoke/`, runs the API through FastAPI's test
+client, uses mock inference, and writes `.smoke/api-smoke/result.json`.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\smoke_api.py
+```
+
+The supervisor smoke verifies restart behavior with a child process that exits:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\smoke_supervisor.py
 ```
 
 Run the regression tests:
@@ -128,13 +161,19 @@ Default runtime files are under `data/` and are ignored by git:
 
 - `data/events.jsonl` - append-only continuity journal
 - `data/core_state.json` - latest core snapshot
-- `data/episodic.db` - SQLite episodic memory
-- `data/semantic.db` - SQLite semantic memory
+- `data/episodic.db` - SQLite episodic memory and embeddings
+- `data/semantic.db` - SQLite semantic memory and embeddings
 - `data/adapter/state.json` - persisted adapter deltas and domain weights
+- `data/adapter/low_rank_adapter.json` - trained low-rank adapter weights
 
-## External Model Path
+## Provider Path
 
-With `inference_provider: "anthropic"` the chat endpoint uses
-`anthropic.AsyncAnthropic()` and the model configured in `inference/engine.py`.
-Set `inference_provider: "mock"` or `PNP_INFERENCE_PROVIDER=mock` for no-live
-model verification.
+Supported provider selectors:
+
+- `mock` - no-live-model verification.
+- `anthropic` - Anthropic Messages API through the installed SDK.
+- `openai_compatible` - `/v1/chat/completions` compatible HTTP providers,
+  including many local gateways.
+- `ollama` - local Ollama `/api/chat`.
+
+Set `PNP_INFERENCE_PROVIDER` and `PNP_MODEL_ID` to override config at runtime.
