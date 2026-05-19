@@ -134,6 +134,7 @@ separate from participant state:
 
 When `C:\Users\Jae\Desktop\mystro-table` is running and Ollama has
 `qwen2.5-coder:7b` installed, this repo includes a live end-to-end smoke that
+creates or uses a named Mystro project, reads that project's `pnpProjectId`,
 loads Mystro participant seats, binds those seats to PNP participant identities,
 runs Qwen-backed PNP chat, checks seat-move continuity, checks replacement-seat
 isolation, records a project toolbox tool and lesson, archives/restores the
@@ -146,7 +147,9 @@ project, and can re-check continuity after a PNP restart:
 
 The smoke writes its evidence to `.smoke\mystro_table_sync\result.json`. It is
 optional and specific to a local Mystro Table + Ollama setup; PNP itself remains
-provider-neutral and can use any configured provider/runtime.
+provider-neutral and can use any configured provider/runtime. Pass
+`--use-active-mystro-project` when you want the smoke to target the currently
+selected Mystro project instead of creating a named smoke project.
 
 ## Run From Source
 

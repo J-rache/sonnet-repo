@@ -248,6 +248,37 @@ def create_and_dispatch_mystro_task(args: argparse.Namespace, project_id: str, s
     return dispatch_packet
 
 
+def create_or_select_mystro_project(args: argparse.Namespace) -> dict[str, Any]:
+    if args.use_active_mystro_project:
+        room = get_json(url_join(args.mystro_url, "/api/room"))
+        active = room.get("activeProject") or {}
+        assert_true(active.get("pnpProjectId"), "Mystro active project did not expose pnpProjectId.")
+        return {
+            "created": False,
+            "project": active,
+            "activeProjectId": active["id"],
+        }
+
+    name = f"PNP Live Sync Smoke {int(time.time())}"
+    packet = post_json(
+        url_join(args.mystro_url, "/api/projects"),
+        {"name": name, "activate": True},
+        headers=mystro_headers(),
+    )
+    project = packet["project"]
+    assert_true(packet["activeProjectId"] == project["id"], "Mystro did not activate the smoke project.")
+    assert_true(project.get("pnpProjectId"), "Mystro project did not expose pnpProjectId.")
+    return {"created": True, **packet}
+
+
+def select_mystro_project(args: argparse.Namespace, project_id: str) -> dict[str, Any]:
+    return patch_json(
+        url_join(args.mystro_url, "/api/projects/active"),
+        {"projectId": project_id},
+        headers=mystro_headers(),
+    )
+
+
 def continuity_context(args: argparse.Namespace, project_id: str, seat: str, query: str) -> dict[str, Any]:
     return get_json(query_url(args.pnp_url, f"/projects/{project_id}/seats/{seat}/continuity", q=query))
 
@@ -258,12 +289,20 @@ def participant_context(args: argparse.Namespace, project_id: str, participant: 
 
 
 def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
-    project_id = args.project_id or f"mystro-table-live-sync-{int(time.time())}"
     service_checks = check_services(args)
     pnp_auth = pnp_headers()
 
+    mystro_project = create_or_select_mystro_project(args)
+    selected_mystro_project = mystro_project["project"]
+    project_id = args.project_id or selected_mystro_project["pnpProjectId"]
+
     mystro_room_before = get_json(url_join(args.mystro_url, "/api/room"))
+    assert_true(
+        mystro_room_before.get("activeProject", {}).get("pnpProjectId") == project_id,
+        "Mystro active project and PNP smoke project id diverged.",
+    )
     last_thoughts = get_json(url_join(args.mystro_url, "/api/resume/last-thoughts"))
+    assert_true(last_thoughts.get("summary", {}).get("pnpProjectId") == project_id, "Last-thoughts package did not use selected project id.")
     post_json(
         url_join(args.mystro_url, "/api/stenographer/notes"),
         {
@@ -435,6 +474,12 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
         "ok": True,
         "mode": "exercise",
         "project_id": project_id,
+        "mystro_project": {
+            "id": selected_mystro_project["id"],
+            "name": selected_mystro_project["name"],
+            "pnpProjectId": selected_mystro_project["pnpProjectId"],
+            "created_by_smoke": mystro_project["created"],
+        },
         "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "services": service_checks,
         "participants": DEFAULT_PARTICIPANTS,
@@ -485,6 +530,10 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
 def run_verify_existing(args: argparse.Namespace) -> dict[str, Any]:
     result = load_result(args.out)
     project_id = result["project_id"]
+    mystro_project = result.get("mystro_project", {})
+    if mystro_project.get("id"):
+        selected = select_mystro_project(args, mystro_project["id"])
+        assert_true(selected["project"]["pnpProjectId"] == project_id, "Mystro restart verification selected the wrong PNP project id.")
     alpha = result["participants"][0]
     service_checks = check_services(args)
     bind = bind_pnp_seat(args, project_id, {**alpha, "seat": "seat-8"})
@@ -519,6 +568,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mystro-url", default="http://127.0.0.1:8787")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--project-id", default="")
+    parser.add_argument("--use-active-mystro-project", action="store_true", help="Use Mystro's current active project instead of creating a named smoke project.")
     parser.add_argument("--out", type=Path, default=Path(".smoke") / "mystro_table_sync" / "result.json")
     parser.add_argument("--verify-existing", action="store_true", help="Verify an existing project result after a PNP restart.")
     return parser.parse_args(argv)
