@@ -135,10 +135,11 @@ separate from participant state:
 When `C:\Users\Jae\Desktop\mystro-table` is running and Ollama has
 `qwen2.5-coder:7b` installed, this repo includes a live end-to-end smoke that
 creates or uses a named Mystro project, reads that project's `pnpProjectId`,
-loads Mystro participant seats, binds those seats to PNP participant identities,
-runs Qwen-backed PNP chat, checks seat-move continuity, checks replacement-seat
-isolation, records a project toolbox tool and lesson, archives/restores the
-project, and can re-check continuity after a PNP restart:
+loads Mystro participant seats, binds those seats to Mystro participant lanes
+and PNP participant identities, runs Qwen-backed PNP chat, checks seat-move
+continuity, checks replacement-seat isolation, records project toolbox tools and
+lessons in both systems, archives/restores the PNP project, and can re-check
+continuity after a PNP restart:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\smoke_mystro_table_sync.py

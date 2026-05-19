@@ -186,6 +186,31 @@ def fill_mystro_seat(args: argparse.Namespace, participant: dict[str, str]) -> d
     return response
 
 
+def bind_mystro_participant(args: argparse.Namespace, mystro_project_id: str, participant: dict[str, str]) -> dict[str, Any]:
+    payload = {
+        "participantIdentity": participant["participant_identity"],
+        "displayName": participant["display_name"],
+        "providerId": "ollama",
+        "modelId": QWEN_MODEL,
+        "resumePoint": f"Live PNP sync smoke route for {participant['participant_identity']}",
+    }
+    response = post_json(
+        url_join(args.mystro_url, f"/api/projects/{mystro_project_id}/seats/{participant['seat']}/bind"),
+        payload,
+        headers=mystro_headers(),
+        timeout=60,
+    )
+    assert_true(
+        response.get("participant", {}).get("participantIdentity") == participant["participant_identity"],
+        f"Mystro did not bind {participant['seat']} to {participant['participant_identity']}.",
+    )
+    assert_true(
+        response.get("hydration", {}).get("source") in {"stenographer_summary_history", "participant_lane_restore_then_summary_update"},
+        f"Mystro participant hydration used the wrong source: {response.get('hydration')}",
+    )
+    return response
+
+
 def bind_pnp_seat(args: argparse.Namespace, project_id: str, participant: dict[str, str]) -> dict[str, Any]:
     payload = {
         "participant_identity": participant["participant_identity"],
@@ -358,10 +383,12 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     mystro_seats = {}
+    mystro_participant_bindings = {}
     pnp_bindings = {}
     pnp_chats = {}
     for participant in DEFAULT_PARTICIPANTS:
         mystro_seats[participant["seat"]] = fill_mystro_seat(args, participant)
+        mystro_participant_bindings[participant["seat"]] = bind_mystro_participant(args, selected_mystro_project["id"], participant)
         bind = bind_pnp_seat(args, project_id, participant)
         assert_true(bind["lane_existed"] is False, f"{participant['participant_identity']} unexpectedly existed before first bind.")
         assert_true(bind["hydration"]["source"] == "stenographer_summary", "First-time participant did not hydrate from stenographer summary.")
@@ -398,6 +425,10 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
 
     alpha_moved = dict(alpha)
     alpha_moved["seat"] = "seat-8"
+    fill_mystro_seat(args, alpha_moved)
+    mystro_move = bind_mystro_participant(args, selected_mystro_project["id"], alpha_moved)
+    assert_true(mystro_move.get("laneExisted") is True, "Mystro did not restore the moved participant lane.")
+    assert_true("seat-5" in mystro_move.get("movedFrom", []), "Mystro did not remove the old seat binding after participant move.")
     move_response = bind_pnp_seat(args, project_id, alpha_moved)
     assert_true(move_response["lane_existed"] is True, "Moved participant did not reconnect to the existing lane.")
     assert_true("seat-5" in move_response["moved_from"], "Seat move did not remove the old seat binding.")
@@ -406,6 +437,8 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
 
     replacement = dict(REPLACEMENT)
     fill_mystro_seat(args, replacement)
+    mystro_replacement_bind = bind_mystro_participant(args, selected_mystro_project["id"], replacement)
+    assert_true(mystro_replacement_bind.get("laneExisted") is False, "Mystro replacement unexpectedly reused the old occupant lane.")
     replacement_bind = bind_pnp_seat(args, project_id, replacement)
     assert_true(replacement_bind["lane_existed"] is False, "Replacement participant unexpectedly reused an existing lane.")
     replacement_context = continuity_context(args, project_id, "seat-5", private_phrase)
@@ -432,6 +465,22 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
     )
     toolbox = get_json(url_join(args.pnp_url, f"/projects/{project_id}/toolbox"))
     assert_true(any(item["id"] == tool["id"] for item in toolbox["tools"]), "Project toolbox did not retain the new smoke tool.")
+    mystro_tool = post_json(
+        url_join(args.mystro_url, f"/api/projects/{selected_mystro_project['id']}/toolbox/tools"),
+        {
+            "name": "mystro-pnp-live-sync-smoke",
+            "description": "Project-retained live smoke helper for Mystro/PNP participant continuity.",
+            "path": "scripts/smoke_mystro_table_sync.py",
+            "source": "live-smoke",
+            "participantIdentity": alpha["participant_identity"],
+        },
+        headers=mystro_headers(),
+    )
+    post_json(
+        url_join(args.mystro_url, f"/api/projects/{selected_mystro_project['id']}/toolbox/tools/{mystro_tool['tool']['id']}/use"),
+        {},
+        headers=mystro_headers(),
+    )
 
     lesson_phrase = "Mystro seat ids are routing only; PNP sync lanes must follow participant identity."
     lesson = post_json(
@@ -448,6 +497,19 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
     assert_true(any(item["id"] == lesson["id"] for item in lessons["lessons"]), "Lesson retrieval did not return the recorded lesson.")
     alpha_context_for_lesson = participant_context(args, project_id, alpha["participant_identity"], lesson_phrase)
     assert_true(lesson_phrase not in compact_json(alpha_context_for_lesson.get("context", "")), "Project lesson polluted participant-only context.")
+    mystro_lesson = post_json(
+        url_join(args.mystro_url, f"/api/projects/{selected_mystro_project['id']}/lessons"),
+        {
+            "text": lesson_phrase,
+            "source": "live-mystro-pnp-sync-smoke",
+            "confidence": 0.95,
+            "tags": ["mystro", "seat-binding", "participant-continuity"],
+        },
+        headers=mystro_headers(),
+    )
+    mystro_continuity = get_json(url_join(args.mystro_url, f"/api/projects/{selected_mystro_project['id']}/continuity"))
+    assert_true(any(item["id"] == mystro_tool["tool"]["id"] for item in mystro_continuity["toolbox"]["tools"]), "Mystro project toolbox did not retain the live smoke tool.")
+    assert_true(any(item["id"] == mystro_lesson["lesson"]["id"] for item in mystro_continuity["lessons"]["lessons"]), "Mystro project lessons did not retain the live smoke lesson.")
 
     mystro_dispatch = create_and_dispatch_mystro_task(args, project_id, "seat-5")
 
@@ -494,6 +556,14 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
             }
             for seat, packet in mystro_seats.items()
         },
+        "mystro_participant_bindings": {
+            seat: {
+                "participantIdentity": packet["participant"]["participantIdentity"],
+                "hydrationSource": packet["hydration"]["source"],
+                "laneExisted": packet["laneExisted"],
+            }
+            for seat, packet in mystro_participant_bindings.items()
+        },
         "pnp_chat_models": {
             seat: {"provider": chat["provider"], "model": chat["model"], "latency_ms": chat["latency_ms"]}
             for seat, chat in pnp_chats.items()
@@ -511,6 +581,10 @@ def run_exercise(args: argparse.Namespace) -> dict[str, Any]:
         },
         "toolbox_tool_id": tool["id"],
         "lesson_id": lesson["id"],
+        "mystro_project_assets": {
+            "tool_id": mystro_tool["tool"]["id"],
+            "lesson_id": mystro_lesson["lesson"]["id"],
+        },
         "mystro_dispatch": {
             "task_id": mystro_dispatch["task"]["id"],
             "delivered": mystro_dispatch["dispatch"]["delivered"],
@@ -536,6 +610,9 @@ def run_verify_existing(args: argparse.Namespace) -> dict[str, Any]:
         assert_true(selected["project"]["pnpProjectId"] == project_id, "Mystro restart verification selected the wrong PNP project id.")
     alpha = result["participants"][0]
     service_checks = check_services(args)
+    if mystro_project.get("id"):
+        mystro_bind = bind_mystro_participant(args, mystro_project["id"], {**alpha, "seat": "seat-8"})
+        assert_true(mystro_bind["laneExisted"] is True, "Mystro returning participant did not reconnect to its saved lane after restart.")
     bind = bind_pnp_seat(args, project_id, {**alpha, "seat": "seat-8"})
     assert_true(bind["lane_existed"] is True, "Returning participant did not reconnect to the saved lane after restart.")
     context = continuity_context(args, project_id, "seat-8", result["private_marker"])
@@ -554,6 +631,7 @@ def run_verify_existing(args: argparse.Namespace) -> dict[str, Any]:
         "ok": True,
         "verified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "services": service_checks,
+        "mystro_returning_lane_existed": mystro_bind["laneExisted"] if mystro_project.get("id") else None,
         "returning_bind_lane_existed": bind["lane_existed"],
         "chat_model": chat["model"],
         "chat_provider": chat["provider"],

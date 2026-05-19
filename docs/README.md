@@ -43,9 +43,10 @@ Implemented behavior:
 - `scripts/smoke_mystro_table_sync.py` performs an optional live Mystro Table
   integration smoke against `127.0.0.1:8787`, installed PNP on `127.0.0.1:8000`,
   and Ollama `qwen2.5-coder:7b`, including selected Mystro project to PNP
-  `project_id` binding, multi-seat participant binding, model-backed chat,
-  seat-move continuity, replacement-seat isolation, toolbox, lessons,
-  archive/restore, and a restart verification mode.
+  `project_id` binding, Mystro participant-lane binding, PNP participant
+  binding, model-backed chat, seat-move continuity, replacement-seat isolation,
+  Mystro and PNP project toolbox/lessons, archive/restore, and a restart
+  verification mode.
 - The process supervisor can restart a crashed child process and use `GET /` as
   a health probe.
 - `install.ps1` installs the app into a per-user standalone layout with copied
