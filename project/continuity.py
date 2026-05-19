@@ -618,10 +618,12 @@ class ProjectContinuityService:
                  source: str = "", created_by: str = "",
                  metadata: Optional[dict[str, Any]] = None,
                  useful: bool = True,
-                 allowed_participants: Optional[list[str]] = None) -> dict[str, Any]:
+                 allowed_participants: Optional[list[str]] = None,
+                 curation_status: str = "proposed") -> dict[str, Any]:
         self.ensure_project(project_id)
         paths = self._paths(project_id)
         toolbox = _load_json(paths["toolbox"], {"tools": []})
+        status = curation_status if curation_status in {"proposed", "verified", "demoted"} else "proposed"
         tool = {
             "id": _new_id("tool"),
             "name": name,
@@ -637,6 +639,7 @@ class ProjectContinuityService:
             "created_at": _now(),
             "last_verified_at": metadata.get("last_verified_at") if metadata else None,
             "scope": "project",
+            "curation_status": status,
         }
         toolbox.setdefault("tools", []).append(tool)
         _save_json(paths["toolbox"], toolbox)
@@ -647,12 +650,34 @@ class ProjectContinuityService:
         self.ensure_project(project_id)
         return _load_json(self._paths(project_id)["toolbox"], {"tools": []}).get("tools", [])
 
+    def verify_tool(self, project_id: str, tool_id: str, status: str = "verified") -> dict[str, Any]:
+        if status not in {"proposed", "verified", "demoted"}:
+            raise ValueError("status must be proposed, verified, or demoted")
+        self.ensure_project(project_id)
+        paths = self._paths(project_id)
+        toolbox = _load_json(paths["toolbox"], {"tools": []})
+        now = _now()
+        for tool in toolbox.get("tools", []):
+            if tool.get("id") == tool_id:
+                tool["curation_status"] = status
+                tool["last_verified_at"] = now if status == "verified" else tool.get("last_verified_at")
+                tool["updated_at"] = now
+                _save_json(paths["toolbox"], toolbox)
+                EventJournal(str(paths["journal"])).append(
+                    "project_tool_curated",
+                    {"tool_id": tool_id, "status": status},
+                )
+                return tool
+        raise KeyError(tool_id)
+
     def add_lesson(self, project_id: str, content: str, source: str,
                    confidence: float = 0.7, tags: Optional[list[str]] = None,
-                   last_verified_at: Optional[float] = None) -> dict[str, Any]:
+                   last_verified_at: Optional[float] = None,
+                   curation_status: str = "verified") -> dict[str, Any]:
         self.ensure_project(project_id)
         paths = self._paths(project_id)
         lessons = _load_json(paths["lessons"], {"lessons": []})
+        status = curation_status if curation_status in {"proposed", "verified", "demoted"} else "verified"
         lesson = {
             "id": _new_id("lesson"),
             "content": content,
@@ -663,6 +688,7 @@ class ProjectContinuityService:
             "last_verified_at": last_verified_at or _now(),
             "scope": "project",
             "promoted": False,
+            "curation_status": status,
         }
         lessons.setdefault("lessons", []).append(lesson)
         _save_json(paths["lessons"], lessons)
@@ -673,6 +699,26 @@ class ProjectContinuityService:
         self.ensure_project(project_id)
         return _load_json(self._paths(project_id)["lessons"], {"lessons": []}).get("lessons", [])
 
+    def verify_lesson(self, project_id: str, lesson_id: str, status: str = "verified") -> dict[str, Any]:
+        if status not in {"proposed", "verified", "demoted"}:
+            raise ValueError("status must be proposed, verified, or demoted")
+        self.ensure_project(project_id)
+        paths = self._paths(project_id)
+        lessons = _load_json(paths["lessons"], {"lessons": []})
+        now = _now()
+        for lesson in lessons.get("lessons", []):
+            if lesson.get("id") == lesson_id:
+                lesson["curation_status"] = status
+                lesson["last_verified_at"] = now if status == "verified" else lesson.get("last_verified_at")
+                lesson["updated_at"] = now
+                _save_json(paths["lessons"], lessons)
+                EventJournal(str(paths["journal"])).append(
+                    "project_lesson_curated",
+                    {"lesson_id": lesson_id, "status": status},
+                )
+                return lesson
+        raise KeyError(lesson_id)
+
     def retrieve_lessons(self, project_id: str, query: str, limit: int = 10) -> list[dict[str, Any]]:
         lessons = self.list_lessons(project_id)
         ranked = sorted(
@@ -682,6 +728,109 @@ class ProjectContinuityService:
             reverse=True,
         )
         return ranked[:limit]
+
+    def export_project_package(self, project_id: str) -> dict[str, Any]:
+        """Return an inspectable JSON package for UI/export flows.
+
+        Full binary lane state such as SQLite memory databases and trained
+        adapter files is preserved by archive_project(). This package is meant
+        for dashboards, support handoff, and redacted inspection.
+        """
+        project = self.get_project(project_id)
+        paths = self._paths(project_id)
+        participants = _load_json(paths["participants"], {"participants": {}}).get("participants", {})
+        lanes = {}
+        for identity in participants:
+            lane_path = self.project_path(project_id) / "participants" / _slug(identity)
+            journal_path = lane_path / "events.jsonl"
+            try:
+                journal_tail = journal_path.read_text(encoding="utf-8").splitlines()[-20:]
+            except OSError:
+                journal_tail = []
+            lanes[identity] = {
+                "manifest": _load_json(lane_path / "manifest.json", {}),
+                "journal_tail": journal_tail,
+                "lane_path": str(lane_path),
+                "episodic_db_path": str(lane_path / "episodic.db"),
+                "semantic_db_path": str(lane_path / "semantic.db"),
+                "adapter_path": str(lane_path / "adapter"),
+            }
+        return {
+            "schema_version": 1,
+            "exported_at": _now(),
+            "project": project,
+            "seat_bindings": _load_json(paths["seats"], {"bindings": {}}).get("bindings", {}),
+            "toolbox": _load_json(paths["toolbox"], {"tools": []}),
+            "lessons": _load_json(paths["lessons"], {"lessons": []}),
+            "participant_lanes": lanes,
+            "complete_archive_note": "Use POST /projects/{project_id}/archive for the full restartable project bundle.",
+        }
+
+    def create_demo_project(self, project_id: str = "pnp-demo-project",
+                            title: str = "PNP Demo Project") -> dict[str, Any]:
+        self.ensure_project(project_id, title=title)
+        self.set_current_state(
+            project_id,
+            {
+                "mode": "demo",
+                "live_model_required": False,
+                "purpose": "Show project continuity, participant lanes, toolbox, and lessons without a provider call.",
+            },
+        )
+        self.record_stenographer_summary(
+            project_id,
+            summary="Demo stenographer summary: project identity comes first and seats are temporary routing.",
+            history_package="Demo history: Participant Alpha can move seats without losing continuity. Participant Beta starts with its own lane.",
+            source="demo_mode",
+            confidence=0.95,
+        )
+        existing_tools = {tool.get("name") for tool in self.list_tools(project_id)}
+        if "Demo Project Smoke" not in existing_tools:
+            self.add_tool(
+                project_id,
+                name="Demo Project Smoke",
+                description="Verifies continuity routing with the mock provider and no live model call.",
+                command="python -m pytest tests/test_project_continuity.py",
+                source="demo_mode",
+                created_by="setup_wizard",
+                curation_status="verified",
+                metadata={"last_verified_at": _now()},
+            )
+        existing_lessons = {lesson.get("content") for lesson in self.list_lessons(project_id)}
+        lesson_text = "Seat ids route participants; they never own memory."
+        if lesson_text not in existing_lessons:
+            self.add_lesson(
+                project_id,
+                content=lesson_text,
+                source="demo_mode",
+                confidence=0.95,
+                tags=["seat_routing", "participant_identity"],
+                curation_status="verified",
+            )
+        self.bind_seat(
+            project_id,
+            "seat-A",
+            "demo:alpha",
+            display_name="Demo Alpha",
+            provider="mock",
+            model_id="mock-model",
+        )
+        self.bind_seat(
+            project_id,
+            "seat-B",
+            "demo:beta",
+            display_name="Demo Beta",
+            provider="mock",
+            model_id="mock-model",
+        )
+        self.record_participant_memory(
+            project_id,
+            "demo:alpha",
+            content="Demo Alpha private continuity marker: restore this lane when Alpha returns.",
+            summary="Demo Alpha has a private continuity marker.",
+            tags=["demo", "private_lane"],
+        )
+        return self.export_project_package(project_id)
 
     def archive_project(self, project_id: str) -> dict[str, Any]:
         project = self.ensure_project(project_id)

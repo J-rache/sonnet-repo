@@ -38,8 +38,17 @@ Implemented behavior:
   summary updates.
 - Project memory, participant continuity, seat bindings, shared toolbox, and
   lessons learned are persisted as separate layers.
+- Project toolbox entries and lessons carry explicit `proposed`, `verified`, or
+  `demoted` curation status so useful assets can be retained without pretending
+  every new helper is trusted.
 - Project archive/restore includes project memory, participant lanes, seat
   bindings, toolbox entries, lessons, and archive metadata.
+- `/setup/status` and `/setup/demo` provide a first-run friendly status/demo
+  surface. Demo mode uses mock/runtime-local state and does not require a live
+  provider call.
+- `/projects/{project_id}/package` returns an inspectable JSON package for
+  dashboards and support handoff. `/archive` remains the complete restartable
+  bundle for participant lane files and adapter state.
 - `scripts/smoke_mystro_table_sync.py` performs an optional live Mystro Table
   integration smoke against `127.0.0.1:8787`, installed PNP on `127.0.0.1:8000`,
   and Ollama `qwen2.5-coder:7b`, including selected Mystro project to PNP

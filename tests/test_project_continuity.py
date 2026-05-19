@@ -133,6 +133,8 @@ def test_shared_toolbox_lessons_and_archive_restore_are_project_scoped(tmp_path)
         useful=True,
     )
     assert tool["scope"] == "project"
+    assert tool["curation_status"] == "proposed"
+    assert service.verify_tool(project_id, tool["id"])["curation_status"] == "verified"
     assert service.bind_seat(project_id, "seat-C", "participant-A")["moved_from"] == ["seat-A"]
     assert service.list_tools(project_id)[0]["id"] == tool["id"]
 
@@ -147,7 +149,14 @@ def test_shared_toolbox_lessons_and_archive_restore_are_project_scoped(tmp_path)
     )
     after_lessons = lane.episodic_memory.stats()["total_episodes"]
     assert after_lessons == before_lessons
+    assert lesson["curation_status"] == "verified"
+    assert service.verify_lesson(project_id, lesson["id"], "demoted")["curation_status"] == "demoted"
+    assert service.verify_lesson(project_id, lesson["id"])["curation_status"] == "verified"
     assert service.retrieve_lessons(project_id, "participant continuity keys")[0]["id"] == lesson["id"]
+
+    package = service.export_project_package(project_id)
+    assert package["project"]["project_id"] == project_id
+    assert "participant-A" in package["participant_lanes"]
 
     archive = service.archive_project(project_id)
     archive_path = Path(archive["archive_path"])
@@ -182,6 +191,16 @@ def test_project_api_routes_preserve_identity_and_do_not_break_single_lane(monke
     headers = {"X-PNP-Token": TOKEN}
     with TestClient(server.app) as client:
         assert client.get("/").status_code == 200
+        setup = client.get("/setup/status")
+        assert setup.status_code == 200
+        assert setup.json()["capabilities"]["demo_mode_without_live_model"] is True
+        demo = client.post(
+            "/setup/demo",
+            json={"project_id": "api-demo-project", "title": "API Demo Project"},
+            headers=headers,
+        )
+        assert demo.status_code == 200
+        assert "demo:alpha" in demo.json()["participant_lanes"]
         assert client.post("/projects", json={"project_id": "api-project"}, headers=headers).status_code == 200
         assert client.post(
             "/projects/api-project/stenographer/summary",
@@ -223,11 +242,24 @@ def test_project_api_routes_preserve_identity_and_do_not_break_single_lane(monke
 
         tool_response = client.post(
             "/projects/api-project/toolbox/tools",
-            json={"name": "api smoke helper", "description": "Useful project tool", "source": "created_on_demand"},
+            json={
+                "name": "api smoke helper",
+                "description": "Useful project tool",
+                "source": "created_on_demand",
+                "curation_status": "proposed",
+            },
             headers=headers,
         )
         assert tool_response.status_code == 200
+        tool_id = tool_response.json()["id"]
         assert client.get("/projects/api-project/toolbox").json()["tools"][0]["name"] == "api smoke helper"
+        verified_tool = client.post(
+            f"/projects/api-project/toolbox/tools/{tool_id}/verify",
+            json={"status": "verified"},
+            headers=headers,
+        )
+        assert verified_tool.status_code == 200
+        assert verified_tool.json()["curation_status"] == "verified"
 
         lesson_response = client.post(
             "/projects/api-project/lessons",
@@ -236,11 +268,23 @@ def test_project_api_routes_preserve_identity_and_do_not_break_single_lane(monke
                 "source": "api-test",
                 "confidence": 0.9,
                 "tags": ["hydration"],
+                "curation_status": "proposed",
             },
             headers=headers,
         )
         assert lesson_response.status_code == 200
+        lesson_id = lesson_response.json()["id"]
         assert client.get("/projects/api-project/lessons?q=hydrate").json()["lessons"][0]["source"] == "api-test"
+        verified_lesson = client.post(
+            f"/projects/api-project/lessons/{lesson_id}/verify",
+            json={"status": "verified"},
+            headers=headers,
+        )
+        assert verified_lesson.status_code == 200
+        assert verified_lesson.json()["curation_status"] == "verified"
+        package_response = client.get("/projects/api-project/package")
+        assert package_response.status_code == 200
+        assert package_response.json()["project"]["project_id"] == "api-project"
 
         chat_response = client.post(
             "/projects/api-project/seats/seat-A/chat",

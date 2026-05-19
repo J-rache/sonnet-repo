@@ -200,6 +200,7 @@ class ProjectToolRequest(BaseModel):
     allowed_participants: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
     useful: bool = True
+    curation_status: str = Field(default="proposed", pattern="^(proposed|verified|demoted)$")
 
 
 class LessonRequest(BaseModel):
@@ -208,6 +209,16 @@ class LessonRequest(BaseModel):
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     tags: list[str] = Field(default_factory=list)
     last_verified_at: Optional[float] = None
+    curation_status: str = Field(default="verified", pattern="^(proposed|verified|demoted)$")
+
+
+class CurationRequest(BaseModel):
+    status: str = Field(default="verified", pattern="^(proposed|verified|demoted)$")
+
+
+class DemoProjectRequest(BaseModel):
+    project_id: str = Field(default="pnp-demo-project", min_length=1, max_length=200)
+    title: str = Field(default="PNP Demo Project", max_length=300)
 
 
 class ProjectChatRequest(BaseModel):
@@ -284,6 +295,69 @@ async def health():
     if _core is None:
         return JSONResponse({"status": "starting"}, status_code=503)
     return {"status": "ok", "uptime_seconds": round(_core.metrics.uptime_seconds, 1)}
+
+
+@app.get("/setup/status", tags=["Status"])
+async def setup_status():
+    provider = _configured_provider()
+    projects = _require_projects().list_projects()
+    host = str(_config.get("api_host", "127.0.0.1"))
+    token_env = _config.get("local_api_token_env", "PNP_LOCAL_TOKEN")
+    token_configured = bool(_get_local_token())
+    warnings = []
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        warnings.append("API host is not loopback. Use a local token and firewall rules before sharing.")
+    if not token_configured:
+        warnings.append("No local token is configured; mutating endpoints are open to the bound host.")
+    if provider == "mock":
+        warnings.append("Mock provider is active. This is good for setup and smoke tests, not live model inference.")
+    return {
+        "status": "ready" if _core is not None else "starting",
+        "api": {
+            "host": host,
+            "port": _config.get("api_port", 8000),
+            "localhost_default": host in {"127.0.0.1", "localhost", "::1"},
+            "token_required": token_configured,
+            "token_env": token_env,
+        },
+        "runtime": {
+            "provider": provider,
+            "model": _configured_model(),
+            "provider_configured": _provider_has_credentials(provider),
+            "live_model_required_for_demo": False,
+        },
+        "storage": {
+            "data_dir": _config.get("data_dir", "./data"),
+            "project_data_dir": _config.get("project_data_dir"),
+            "project_archive_dir": _config.get("project_archive_dir"),
+        },
+        "projects": {
+            "total": len(projects),
+            "archived": len([project for project in projects if project.get("archived")]),
+            "open": len([project for project in projects if not project.get("archived")]),
+        },
+        "capabilities": {
+            "single_lane_api": True,
+            "project_continuity": True,
+            "participant_identity_lanes": True,
+            "seat_bindings_are_routing_only": True,
+            "shared_toolbox": True,
+            "lessons_learned": True,
+            "archive_restore": True,
+            "demo_mode_without_live_model": True,
+            "hidden_provider_weight_mutation": False,
+        },
+        "warnings": warnings,
+    }
+
+
+@app.post("/setup/demo", tags=["Status"])
+async def create_demo_project(
+    request: DemoProjectRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return _require_projects().create_demo_project(request.project_id, title=request.title)
 
 
 @app.post("/chat", tags=["Interaction"])
@@ -653,6 +727,11 @@ async def get_project(project_id: str):
     return _require_projects().get_project(project_id)
 
 
+@app.get("/projects/{project_id}/package", tags=["Projects"])
+async def get_project_package(project_id: str):
+    return _require_projects().export_project_package(project_id)
+
+
 @app.get("/projects/{project_id}/memory", tags=["Projects"])
 async def get_project_memory(project_id: str):
     project = _require_projects().get_project(project_id)
@@ -926,8 +1005,25 @@ async def add_project_tool(
         allowed_participants=request.allowed_participants,
         metadata=request.metadata,
         useful=request.useful,
+        curation_status=request.curation_status,
     )
     return tool
+
+
+@app.post("/projects/{project_id}/toolbox/tools/{tool_id}/verify", tags=["Projects"])
+async def curate_project_tool(
+    project_id: str,
+    tool_id: str,
+    request: CurationRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    try:
+        return _require_projects().verify_tool(project_id, tool_id, status=request.status)
+    except KeyError as e:
+        raise HTTPException(404, detail=f"Project tool not found: {tool_id}") from e
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e)) from e
 
 
 @app.get("/projects/{project_id}/lessons", tags=["Projects"])
@@ -951,7 +1047,24 @@ async def add_project_lesson(
         confidence=request.confidence,
         tags=request.tags,
         last_verified_at=request.last_verified_at,
+        curation_status=request.curation_status,
     )
+
+
+@app.post("/projects/{project_id}/lessons/{lesson_id}/verify", tags=["Projects"])
+async def curate_project_lesson(
+    project_id: str,
+    lesson_id: str,
+    request: CurationRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    try:
+        return _require_projects().verify_lesson(project_id, lesson_id, status=request.status)
+    except KeyError as e:
+        raise HTTPException(404, detail=f"Project lesson not found: {lesson_id}") from e
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e)) from e
 
 
 @app.post("/projects/{project_id}/archive", tags=["Projects"])

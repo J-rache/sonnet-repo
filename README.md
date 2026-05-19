@@ -125,10 +125,19 @@ separate from participant state:
   A returning participant restores its own lane first, then receives any newer
   project summary update.
 - Shared toolbox entries and lessons learned are project-scoped. Toolbox entries
-  can name allowed participants, are not seat-scoped, and are not promoted to
-  global tools or global lessons by default.
+  can name allowed participants, carry `proposed` / `verified` / `demoted`
+  curation status, are not seat-scoped, and are not promoted to global tools or
+  global lessons by default.
 - Project archive/restore includes project memory, participant lanes, seat
   bindings, toolbox entries, lessons, and archive metadata.
+- `GET /setup/status` gives a product-facing setup/health view: local host,
+  token posture, provider/model, storage paths, project counts, capabilities,
+  and warnings.
+- `POST /setup/demo` creates a mock/demo project with participants, toolbox,
+  lessons, and no live model call.
+- `GET /projects/{project_id}/package` returns an inspectable JSON project
+  package for UI export/support. Use `/archive` for the complete restartable
+  bundle containing binary lane state such as SQLite databases and adapters.
 
 ## Live Mystro Table Smoke
 
@@ -225,6 +234,13 @@ manual episodic memory writes, manual consolidation, `/feedback`, and
 Project continuity endpoints use the same local token for mutations:
 
 ```powershell
+curl.exe http://127.0.0.1:8000/setup/status
+
+curl.exe -X POST http://127.0.0.1:8000/setup/demo `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"project_id\":\"pnp-demo-project\"}"
+
 curl.exe -X POST http://127.0.0.1:8000/projects `
   -H "Content-Type: application/json" `
   -H "X-PNP-Token: $token" `
@@ -244,6 +260,8 @@ curl.exe -X POST http://127.0.0.1:8000/projects/mystro-project/seats/seat-A/chat
   -H "Content-Type: application/json" `
   -H "X-PNP-Token: $token" `
   -d "{\"message\":\"Continue from your participant lane and project history.\"}"
+
+curl.exe http://127.0.0.1:8000/projects/mystro-project/package
 ```
 
 ## Verification

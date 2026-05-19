@@ -56,6 +56,18 @@ def main() -> int:
         root = client.get("/")
         result["checks"].append(["GET /", root.status_code])
 
+        setup = client.get("/setup/status")
+        result["checks"].append(["GET /setup/status", setup.status_code])
+        result["setup_status"] = setup.json()
+
+        demo = client.post(
+            "/setup/demo",
+            json={"project_id": "smoke-demo-project", "title": "Smoke Demo Project"},
+            headers=headers,
+        )
+        result["checks"].append(["POST /setup/demo", demo.status_code])
+        result["demo_project_has_lanes"] = "demo:alpha" in demo.json().get("participant_lanes", {})
+
         unauthorized = client.post("/goals", json={"description": "blocked"})
         result["checks"].append(["POST /goals without token", unauthorized.status_code])
 
@@ -210,6 +222,12 @@ def main() -> int:
             headers=headers,
         )
         result["checks"].append(["POST /projects/{id}/toolbox/tools", tool.status_code])
+        tool_verified = client.post(
+            f"/projects/smoke-project/toolbox/tools/{tool.json()['id']}/verify",
+            json={"status": "verified"},
+            headers=headers,
+        )
+        result["checks"].append(["POST /projects/{id}/toolbox/tools/{tool_id}/verify", tool_verified.status_code])
 
         lesson = client.post(
             "/projects/smoke-project/lessons",
@@ -222,6 +240,16 @@ def main() -> int:
             headers=headers,
         )
         result["checks"].append(["POST /projects/{id}/lessons", lesson.status_code])
+        lesson_verified = client.post(
+            f"/projects/smoke-project/lessons/{lesson.json()['id']}/verify",
+            json={"status": "verified"},
+            headers=headers,
+        )
+        result["checks"].append(["POST /projects/{id}/lessons/{lesson_id}/verify", lesson_verified.status_code])
+
+        package = client.get("/projects/smoke-project/package")
+        result["checks"].append(["GET /projects/{id}/package", package.status_code])
+        result["package_has_participant_lanes"] = "participant-X" in package.json().get("participant_lanes", {})
 
         project_chat = client.post(
             "/projects/smoke-project/seats/seat-A/chat",
@@ -244,7 +272,12 @@ def main() -> int:
     result["event_types"] = sorted(set(event_types))
     result["artifact_dir"] = str(artifact_dir)
     result["journal_path"] = str(journal_path)
-    result["ok"] = all(status in {200, 401} for _, status in result["checks"]) and result.get("project_continuity_isolated", False)
+    result["ok"] = (
+        all(status in {200, 401} for _, status in result["checks"])
+        and result.get("project_continuity_isolated", False)
+        and result.get("demo_project_has_lanes", False)
+        and result.get("package_has_participant_lanes", False)
+    )
 
     result_path = artifact_dir / "result.json"
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
