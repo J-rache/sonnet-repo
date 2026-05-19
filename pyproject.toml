@@ -40,7 +40,7 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["core*", "memory*", "inference*", "adapters*", "api*", "daemon*"]
+include = ["core*", "memory*", "inference*", "adapters*", "api*", "daemon*", "project*"]
 
 [tool.setuptools]
 py-modules = ["main"]

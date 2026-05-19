@@ -165,6 +165,8 @@ embed_path: $(Quote-Yaml (Join-Path $DataRoot 'embeddings.pkl'))
 adapter_path: $(Quote-Yaml (Join-Path $DataRoot 'adapter'))
 core_state_path: $(Quote-Yaml (Join-Path $DataRoot 'core_state.json'))
 journal_path: $(Quote-Yaml (Join-Path $DataRoot 'events.jsonl'))
+project_data_dir: $(Quote-Yaml (Join-Path $DataRoot 'projects'))
+project_archive_dir: $(Quote-Yaml (Join-Path $DataRoot 'project_archives'))
 
 consolidation_batch_size: 20
 episodic_decay_rate_per_hour: 0.02

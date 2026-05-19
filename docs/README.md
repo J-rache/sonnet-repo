@@ -30,6 +30,16 @@ Implemented behavior:
   and Ollama.
 - Consolidation can use the configured provider for JSON fact extraction and
   falls back to local rules when no live provider is configured.
+- Project continuity supports many participant lanes inside one running service.
+- Participant continuity is keyed by `project_id + participant_identity`; seat
+  ids are only temporary routing bindings.
+- New project participants hydrate from stenographer summary/history. Returning
+  participants restore their own lane first and then receive newer project
+  summary updates.
+- Project memory, participant continuity, seat bindings, shared toolbox, and
+  lessons learned are persisted as separate layers.
+- Project archive/restore includes project memory, participant lanes, seat
+  bindings, toolbox entries, lessons, and archive metadata.
 - The process supervisor can restart a crashed child process and use `GET /` as
   a health probe.
 - `install.ps1` installs the app into a per-user standalone layout with copied

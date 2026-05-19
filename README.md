@@ -19,6 +19,9 @@ part of retrieval and inference context.
   memory, deterministic local embedding retrieval, and consolidation.
 - `adapters/lora.py` stores feedback deltas, gates them with invariants, trains a
   persisted low-rank adapter model, and returns adaptation context.
+- `project/continuity.py` owns project-wide memory, participant continuity
+  lanes, temporary seat bindings, shared toolbox entries, lessons learned, and
+  project archive/restore.
 - `inference/providers.py` supports `mock`, `anthropic`, `openai_compatible`,
   and `ollama` providers.
 - `daemon/supervisor.py` can restart a crashed child process and perform health
@@ -104,6 +107,29 @@ pack and context. For local Hugging Face-style causal-LM runtimes, set
 the `train` extras; PNP will train and save a real PEFT LoRA adapter under the
 adapter directory.
 
+## Project Continuity
+
+One running service can hold a whole Mystro-style project. Project state is
+separate from participant state:
+
+- Project memory stores facts, decisions, goals, current state, history,
+  stenographer summaries, and archive metadata.
+- Participant continuity is keyed by `project_id + participant_identity` and
+  owns that participant's journal, episodic/semantic memory, adapter/sync state,
+  and resume point.
+- Seat bindings are temporary routing, for example `seat-A -> participant-X`.
+  Seat ids never own memory.
+- A participant that moves seats keeps its own lane. A new participant entering
+  an old seat starts or restores its own lane, not the old occupant's lane.
+- A first-time participant is hydrated from stenographer project summary/history.
+  A returning participant restores its own lane first, then receives any newer
+  project summary update.
+- Shared toolbox entries and lessons learned are project-scoped. Toolbox entries
+  can name allowed participants, are not seat-scoped, and are not promoted to
+  global tools or global lessons by default.
+- Project archive/restore includes project memory, participant lanes, seat
+  bindings, toolbox entries, lessons, and archive metadata.
+
 ## Run From Source
 
 ```powershell
@@ -174,6 +200,30 @@ manual episodic memory writes, manual consolidation, `/feedback`, and
 `/adapter/train`.
 `GET /adapter/sync` shows the current sync-model pack and context.
 
+Project continuity endpoints use the same local token for mutations:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/projects `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"project_id\":\"mystro-project\"}"
+
+curl.exe -X POST http://127.0.0.1:8000/projects/mystro-project/stenographer/summary `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"summary\":\"Current table state and verified project history.\"}"
+
+curl.exe -X POST http://127.0.0.1:8000/projects/mystro-project/seats/seat-A/bind `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"participant_identity\":\"provider:model:worker-1\",\"model_id\":\"qwen2.5-coder:7b\"}"
+
+curl.exe -X POST http://127.0.0.1:8000/projects/mystro-project/seats/seat-A/chat `
+  -H "Content-Type: application/json" `
+  -H "X-PNP-Token: $token" `
+  -d "{\"message\":\"Continue from your participant lane and project history.\"}"
+```
+
 ## Verification
 
 ```powershell
@@ -217,6 +267,18 @@ Implemented:
   that binds prior sessions to whichever model/provider is selected on startup.
 - Optional PEFT/LoRA training is wired for local trainable Hugging Face-style
   runtimes when training dependencies and a local base model are configured.
+- Project continuity supports many participant lanes inside one service
+  instance, keyed by `project_id + participant_identity` rather than seat.
+- Seat bindings are a remappable routing layer. Moving a participant to another
+  seat preserves that participant's lane; replacing a seat occupant does not
+  inherit the old occupant's continuity.
+- First-time project participants hydrate from stenographer summary/history.
+  Returning participants restore their own lane and then take newer project
+  summary updates.
+- Project-scoped shared toolbox and lessons learned persist separately from
+  participant-specific memory and adapter deltas.
+- Project archive/restore preserves project memory, participant lanes, seat
+  bindings, toolbox entries, lessons, and archive metadata.
 - The supervisor can restart a crashed process and run health checks.
 - `install.ps1` installs PNP as a per-user standalone local app with its own
   venv, installed config, launchers, optional Desktop shortcuts, and smoke

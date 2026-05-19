@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 _config: dict = {}
 _core = None
 _adapter = None
+_projects = None
 
 
 def _get_local_token() -> str:
@@ -65,11 +66,12 @@ def _configured_model(request_model: Optional[str] = None) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _core, _adapter, _config
+    global _core, _adapter, _config, _projects
 
     import yaml
     from adapters.lora import ExperienceAdapter
     from core.process import PersistentCore
+    from project.continuity import ProjectContinuityService
 
     config_path = os.environ.get("PNP_CONFIG_PATH") or os.environ.get("PNP_CONFIG", "config/default.yaml")
     with open(config_path, encoding="utf-8") as f:
@@ -81,6 +83,7 @@ async def lifespan(app: FastAPI):
         base_model_id=_configured_model(),
         config=config,
     )
+    _projects = ProjectContinuityService(config)
 
     provider = _configured_provider()
     logger.info("Inference provider configured: %s model=%s", provider, _configured_model())
@@ -143,6 +146,82 @@ class EpisodeRequest(BaseModel):
     salience: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
+class ProjectRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=200)
+    title: str = Field(default="", max_length=300)
+
+
+class ProjectMemoryRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=20000)
+    source: str = Field(default="", max_length=300)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    metadata: dict = Field(default_factory=dict)
+
+
+class ProjectStateRequest(BaseModel):
+    state: dict = Field(default_factory=dict)
+
+
+class StenographerSummaryRequest(BaseModel):
+    summary: str = Field(..., min_length=1, max_length=20000)
+    history_package: str = Field(default="", max_length=50000)
+    source: str = Field(default="stenographer", max_length=300)
+    confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+
+
+class SeatBindRequest(BaseModel):
+    participant_identity: str = Field(..., min_length=1, max_length=300)
+    display_name: str = Field(default="", max_length=300)
+    provider: str = Field(default="", max_length=80)
+    model_id: str = Field(default="", max_length=300)
+    metadata: dict = Field(default_factory=dict)
+
+
+class ParticipantMemoryRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=20000)
+    summary: str = Field(..., min_length=1, max_length=2000)
+    tags: list[str] = Field(default_factory=list)
+    valence: float = Field(default=0.0, ge=-1.0, le=1.0)
+    salience: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+class ResumePointRequest(BaseModel):
+    resume_point: dict = Field(default_factory=dict)
+
+
+class ProjectToolRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    tool_type: str = Field(default="utility", max_length=80)
+    command: str = Field(default="", max_length=2000)
+    path: str = Field(default="", max_length=2000)
+    source: str = Field(default="", max_length=300)
+    created_by: str = Field(default="", max_length=300)
+    allowed_participants: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+    useful: bool = True
+
+
+class LessonRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=5000)
+    source: str = Field(..., min_length=1, max_length=500)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    tags: list[str] = Field(default_factory=list)
+    last_verified_at: Optional[float] = None
+
+
+class ProjectChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=10000)
+    concepts: list[str] = Field(default_factory=list)
+    model: Optional[str] = None
+    max_tokens: int = Field(default=512, ge=1, le=4096)
+
+
+class ProjectArchiveRestoreRequest(BaseModel):
+    archive_path: str = Field(..., min_length=1)
+    overwrite: bool = True
+
+
 def _require_core():
     if _core is None:
         raise HTTPException(503, detail="Persistent core not initialized")
@@ -153,6 +232,12 @@ def _require_adapter():
     if _adapter is None:
         raise HTTPException(503, detail="Experience adapter not initialized")
     return _adapter
+
+
+def _require_projects():
+    if _projects is None:
+        raise HTTPException(503, detail="Project continuity service not initialized")
+    return _projects
 
 
 def _provider_has_credentials(provider: str) -> bool:
@@ -547,3 +632,347 @@ async def get_adaptation_context(q: str = Query(...), domain: Optional[str] = No
     adapter = _require_adapter()
     context = adapter.get_adaptation_context(q, domain=domain)
     return {"query": q, "adaptation_context": context or "(none)"}
+
+
+@app.get("/projects", tags=["Projects"])
+async def list_projects():
+    return {"projects": _require_projects().list_projects()}
+
+
+@app.post("/projects", tags=["Projects"])
+async def create_project(
+    request: ProjectRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return _require_projects().ensure_project(request.project_id, title=request.title)
+
+
+@app.get("/projects/{project_id}", tags=["Projects"])
+async def get_project(project_id: str):
+    return _require_projects().get_project(project_id)
+
+
+@app.get("/projects/{project_id}/memory", tags=["Projects"])
+async def get_project_memory(project_id: str):
+    project = _require_projects().get_project(project_id)
+    return {"project_id": project_id, "memory": project.get("memory", {})}
+
+
+@app.post("/projects/{project_id}/memory/{kind}", tags=["Projects"])
+async def add_project_memory(
+    project_id: str,
+    kind: str,
+    request: ProjectMemoryRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    try:
+        item = _require_projects().add_project_memory(
+            project_id,
+            kind,
+            content=request.content,
+            source=request.source,
+            confidence=request.confidence,
+            metadata=request.metadata,
+        )
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e)) from e
+    return item
+
+
+@app.post("/projects/{project_id}/state", tags=["Projects"])
+async def set_project_state(
+    project_id: str,
+    request: ProjectStateRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return {"project_id": project_id, "current_state": _require_projects().set_current_state(project_id, request.state)}
+
+
+@app.post("/projects/{project_id}/stenographer/summary", tags=["Projects"])
+async def add_stenographer_summary(
+    project_id: str,
+    request: StenographerSummaryRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    item = _require_projects().record_stenographer_summary(
+        project_id,
+        summary=request.summary,
+        source=request.source,
+        history_package=request.history_package,
+        confidence=request.confidence,
+    )
+    return item
+
+
+@app.get("/projects/{project_id}/context", tags=["Projects"])
+async def get_project_context(project_id: str, q: str = Query(default="")):
+    return {
+        "project_id": project_id,
+        "context": _require_projects().build_project_context(project_id, query=q),
+    }
+
+
+@app.get("/projects/{project_id}/seats", tags=["Projects"])
+async def get_seat_bindings(project_id: str):
+    return {"project_id": project_id, "bindings": _require_projects().seat_bindings(project_id)}
+
+
+@app.post("/projects/{project_id}/seats/{seat_id}/bind", tags=["Projects"])
+async def bind_project_seat(
+    project_id: str,
+    seat_id: str,
+    request: SeatBindRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return _require_projects().bind_seat(
+        project_id,
+        seat_id,
+        participant_identity=request.participant_identity,
+        display_name=request.display_name,
+        provider=request.provider,
+        model_id=request.model_id,
+        metadata=request.metadata,
+    )
+
+
+@app.get("/projects/{project_id}/participants", tags=["Projects"])
+async def get_project_participants(project_id: str):
+    project = _require_projects().get_project(project_id)
+    return {"project_id": project_id, "participants": project.get("participants", {})}
+
+
+@app.get("/projects/{project_id}/participants/{participant_identity}", tags=["Projects"])
+async def get_participant_lane(
+    project_id: str,
+    participant_identity: str,
+    q: str = Query(default=""),
+):
+    service = _require_projects()
+    if not service.participant_exists(project_id, participant_identity):
+        raise HTTPException(404, detail="Participant continuity lane not found")
+    lane = service.participant_lane(project_id, participant_identity)
+    return lane.to_dict(include_context=bool(q), query=q)
+
+
+@app.get("/projects/{project_id}/seats/{seat_id}/continuity", tags=["Projects"])
+async def get_seat_continuity(project_id: str, seat_id: str, q: str = Query(default="")):
+    try:
+        lane = _require_projects().lane_for_seat(project_id, seat_id)
+    except KeyError as e:
+        raise HTTPException(404, detail=str(e)) from e
+    return lane.to_dict(include_context=bool(q), query=q)
+
+
+@app.post("/projects/{project_id}/participants/{participant_identity}/memory", tags=["Projects"])
+async def add_participant_memory(
+    project_id: str,
+    participant_identity: str,
+    request: ParticipantMemoryRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return _require_projects().record_participant_memory(
+        project_id,
+        participant_identity,
+        content=request.content,
+        summary=request.summary,
+        tags=request.tags,
+        valence=request.valence,
+        salience=request.salience,
+    )
+
+
+@app.post("/projects/{project_id}/participants/{participant_identity}/resume-point", tags=["Projects"])
+async def set_participant_resume_point(
+    project_id: str,
+    participant_identity: str,
+    request: ResumePointRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    lane = _require_projects().participant_lane(project_id, participant_identity)
+    return {"project_id": project_id, "participant_identity": participant_identity, "resume_point": lane.set_resume_point(request.resume_point)}
+
+
+@app.post("/projects/{project_id}/participants/{participant_identity}/feedback", tags=["Projects"])
+async def add_participant_feedback(
+    project_id: str,
+    participant_identity: str,
+    request: FeedbackRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    lane = _require_projects().participant_lane(project_id, participant_identity)
+    applied = lane.apply_delta(
+        content=request.content,
+        feedback=request.feedback,
+        domain=request.domain,
+        confidence=request.confidence,
+        invariant_check=True,
+    )
+    return {"applied": applied, "participant_identity": participant_identity, "adapter_stats": lane.adapter.stats()}
+
+
+@app.post("/projects/{project_id}/seats/{seat_id}/chat", tags=["Projects"])
+async def project_seat_chat(
+    project_id: str,
+    seat_id: str,
+    request: ProjectChatRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    service = _require_projects()
+    try:
+        lane = service.lane_for_seat(project_id, seat_id)
+    except KeyError as e:
+        raise HTTPException(404, detail=str(e)) from e
+
+    participant_context = lane.build_context(request.message)
+    project_context = service.build_project_context(project_id, query=request.message)
+    binding = service.seat_bindings(project_id).get(seat_id, {})
+
+    from inference.engine import InferenceRequest
+    from inference.providers import run_provider_inference
+
+    created_at = float(lane.manifest.get("created_at", time.time()))
+    core_state = {
+        "uptime_seconds": max(0.0, time.time() - created_at),
+        "heartbeat_count": lane.journal.last_sequence,
+        "consolidation_cycles": 0,
+        "active_goals": [],
+        "motivational_state": {"mode": "project_continuity"},
+        "salience_map": {concept: 0.5 for concept in request.concepts[:10]},
+    }
+    model = request.model or binding.get("model_id") or _configured_model()
+    inf_req = InferenceRequest(
+        user_input=request.message,
+        working_memory_context=project_context + "\n\n" + participant_context.working_memory,
+        episodic_context=participant_context.episodic,
+        semantic_context=participant_context.semantic,
+        adaptation_context=participant_context.adaptation,
+        core_state=core_state,
+        model=model,
+        max_tokens=request.max_tokens,
+    )
+    try:
+        result = await run_provider_inference(inf_req, _config)
+    except Exception as e:
+        provider = _configured_provider()
+        logger.exception("Project inference provider failed: %s", provider)
+        raise HTTPException(502, detail=f"Inference provider '{provider}' failed: {e}") from e
+
+    lane.store_interaction(request.message, result.content, valence=result.valence, tags=["project_chat", seat_id])
+    if request.message and result.content:
+        lane.apply_delta(
+            content=f"Q: {request.message[:100]} A: {result.content[:100]}",
+            feedback=0.3,
+            domain="project_interaction",
+            confidence=0.4,
+            invariant_check=True,
+        )
+    service.add_project_memory(
+        project_id,
+        "history",
+        content=f"[{seat_id} -> {lane.participant_identity}] {request.message[:200]}",
+        source="project_chat",
+        confidence=0.4,
+        metadata={"seat_id": seat_id, "participant_identity": lane.participant_identity},
+    )
+    return {
+        "response": result.content,
+        "tokens_used": result.tokens_used,
+        "latency_ms": round(result.latency_ms),
+        "provider": result.metadata.get("provider", _configured_provider()),
+        "model": result.metadata.get("model", model),
+        "project_id": project_id,
+        "seat_id": seat_id,
+        "participant_identity": lane.participant_identity,
+        "context_used": {
+            "project_memory": bool(project_context),
+            "participant_episodic": bool(participant_context.episodic),
+            "participant_semantic": bool(participant_context.semantic),
+            "participant_adaptation": bool(participant_context.adaptation),
+            "participant_working_memory": bool(participant_context.working_memory),
+        },
+    }
+
+
+@app.get("/projects/{project_id}/toolbox", tags=["Projects"])
+async def get_project_toolbox(project_id: str):
+    return {"project_id": project_id, "tools": _require_projects().list_tools(project_id)}
+
+
+@app.post("/projects/{project_id}/toolbox/tools", tags=["Projects"])
+async def add_project_tool(
+    project_id: str,
+    request: ProjectToolRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    tool = _require_projects().add_tool(
+        project_id,
+        name=request.name,
+        description=request.description,
+        tool_type=request.tool_type,
+        command=request.command,
+        path=request.path,
+        source=request.source,
+        created_by=request.created_by,
+        allowed_participants=request.allowed_participants,
+        metadata=request.metadata,
+        useful=request.useful,
+    )
+    return tool
+
+
+@app.get("/projects/{project_id}/lessons", tags=["Projects"])
+async def get_project_lessons(project_id: str, q: str = Query(default=""), limit: int = Query(default=10, ge=1, le=100)):
+    service = _require_projects()
+    lessons = service.retrieve_lessons(project_id, q, limit=limit) if q else service.list_lessons(project_id)[:limit]
+    return {"project_id": project_id, "lessons": lessons}
+
+
+@app.post("/projects/{project_id}/lessons", tags=["Projects"])
+async def add_project_lesson(
+    project_id: str,
+    request: LessonRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return _require_projects().add_lesson(
+        project_id,
+        content=request.content,
+        source=request.source,
+        confidence=request.confidence,
+        tags=request.tags,
+        last_verified_at=request.last_verified_at,
+    )
+
+
+@app.post("/projects/{project_id}/archive", tags=["Projects"])
+async def archive_project(
+    project_id: str,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    return _require_projects().archive_project(project_id)
+
+
+@app.post("/projects/{project_id}/restore", tags=["Projects"])
+async def restore_project(
+    project_id: str,
+    request: ProjectArchiveRestoreRequest,
+    x_pnp_token: Optional[str] = Header(default=None, alias="X-PNP-Token"),
+):
+    _require_auth(x_pnp_token)
+    try:
+        return _require_projects().restore_project(project_id, request.archive_path, overwrite=request.overwrite)
+    except FileNotFoundError as e:
+        raise HTTPException(404, detail=str(e)) from e
+    except FileExistsError as e:
+        raise HTTPException(409, detail=str(e)) from e

@@ -31,6 +31,10 @@ adapter_path: "./data/adapter"
 core_state_path: "./data/core_state.json"
 journal_path: "./data/events.jsonl"
 
+# Project continuity
+project_data_dir: "./data/projects"
+project_archive_dir: "./data/project_archives"
+
 # Consolidation
 consolidation_batch_size: 20
 episodic_decay_rate_per_hour: 0.02
