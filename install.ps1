@@ -7,6 +7,8 @@ param(
     [switch]$CreateDesktopShortcuts,
     [switch]$NoDesktopShortcuts,
     [switch]$SkipDependencyInstall,
+    [switch]$InstallTrainingDeps,
+    [string]$SyncModelBase = '',
     [switch]$Force
 )
 

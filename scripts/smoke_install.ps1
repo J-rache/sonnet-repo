@@ -14,8 +14,28 @@ if (-not $installRootFull.StartsWith($expectedParent, [System.StringComparison]:
     throw "Refusing to remove or overwrite install root outside .install-smoke: $installRootFull"
 }
 
+function Remove-TreeWithRetry {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    $lastError = $null
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            $lastError = $_
+            Start-Sleep -Milliseconds (200 * $attempt)
+        }
+    }
+    throw $lastError
+}
+
 if (Test-Path -LiteralPath $installRootFull) {
-    Remove-Item -LiteralPath $installRootFull -Recurse -Force
+    Remove-TreeWithRetry -Path $installRootFull
 }
 
 $installer = Join-Path $repoRoot 'install.ps1'
@@ -51,5 +71,5 @@ $result = [ordered]@{
 $result | ConvertTo-Json -Depth 6
 
 if (-not $Keep) {
-    Remove-Item -LiteralPath $installRootFull -Recurse -Force
+    Remove-TreeWithRetry -Path $installRootFull
 }

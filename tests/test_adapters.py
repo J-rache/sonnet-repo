@@ -196,3 +196,48 @@ class TestExperienceAdapter:
         assert "deltas_in_memory" in stats
         assert "domain_weights" in stats
         assert "drift_status" in stats
+        assert "sync_model_adapter" in stats
+
+    def test_sync_model_pack_persists_across_instances(self, tmp_path):
+        config = {"adapter_path": str(tmp_path / "adapter")}
+        a1 = ExperienceAdapter("sync-model", config)
+        a1.apply_delta(
+            ExperienceDelta(
+                content="Use the sync model context to bind prior sessions.",
+                feedback=0.8,
+                domain="continuity",
+                confidence=0.9,
+            ),
+            invariant_check=False,
+        )
+        metrics = a1.train_adapter(epochs=2)
+        assert metrics["sync_model_adapter"]["delta_count"] == 1
+        assert (tmp_path / "adapter" / "sync_model_pack.json").exists()
+        assert (tmp_path / "adapter" / "sync_model_context.md").exists()
+
+        a2 = ExperienceAdapter("sync-model", config)
+        state = a2.sync_model_state()
+        assert state["delta_count"] == 1
+        assert "SYNC MODEL ADAPTER STATE" in a2.get_sync_model_context()
+        assert "SYNC MODEL ADAPTER STATE" in a2.get_adaptation_context("sync prior sessions")
+
+    def test_peft_backend_reports_unavailable_without_model_config(self, tmp_path):
+        config = {
+            "adapter_path": str(tmp_path / "adapter"),
+            "sync_model_adapter_backend": "peft_lora",
+        }
+        adapter = ExperienceAdapter("sync-model", config)
+        adapter.apply_delta(
+            ExperienceDelta(
+                content="Train a local adapter when a trainable runtime is configured.",
+                feedback=0.9,
+                domain="training",
+                confidence=0.9,
+            ),
+            invariant_check=False,
+        )
+        metrics = adapter.train_adapter(epochs=1)
+        peft = metrics["sync_model_adapter"]["peft_lora"]
+        assert peft["backend"] == "peft_lora"
+        assert peft["status"] == "unavailable"
+        assert peft["trained"] is False

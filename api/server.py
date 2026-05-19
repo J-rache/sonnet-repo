@@ -521,6 +521,15 @@ async def adapter_stats():
     return _require_adapter().stats()
 
 
+@app.get("/adapter/sync", tags=["Learning"])
+async def adapter_sync_state():
+    adapter = _require_adapter()
+    return {
+        "sync_model_adapter": adapter.sync_model_state(),
+        "sync_model_context": adapter.get_sync_model_context(),
+    }
+
+
 @app.get("/adapter/drift", tags=["Learning"])
 async def check_drift():
     adapter = _require_adapter()

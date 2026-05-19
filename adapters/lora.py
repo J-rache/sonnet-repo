@@ -14,10 +14,10 @@ embedding vector for real similarity-based retrieval. The adapter:
   - Checkpoints state periodically for rollback capability
   - Detects drift via statistical analysis of recent feedback distribution
 
-In production this would modify actual LoRA weight matrices. Here it
-implements the full behavioral logic: retrieval, scoring, invariant gating,
-drift detection, and context injection — with the weight-update layer
-clearly separated as the integration point for a real training backend.
+By default this layer persists local low-rank adapter state and sync context.
+When a local trainable causal-LM runtime is configured, the sync backend can
+also train and save a PEFT LoRA adapter without claiming access to private
+provider weights.
 """
 
 import json
@@ -89,10 +89,12 @@ class ExperienceAdapter:
         self._engine = None
         self._last_training_metrics: dict = {}
         self._last_trained_at: Optional[float] = None
+        self._sync_pack: dict = {}
 
         self._load_state()
         self._load_deltas()
         self._init_low_rank()
+        self._load_sync_pack()
         # If we loaded deltas and auto_train is on, train the low_rank adapter now
         if self._deltas and self.config.get("adapter_auto_train", True):
             self._train_low_rank()
@@ -176,7 +178,8 @@ class ExperienceAdapter:
             min_d = self.config.get("adapter_train_min_deltas", 1)
             interval = self.config.get("adapter_train_interval", 1)
             if len(self._deltas) >= min_d and self._update_count % max(interval, 1) == 0:
-                self._train_low_rank()
+                low_rank_metrics = self._train_low_rank()
+                self._train_sync_model_adapter(low_rank_metrics)
         self._save_low_rank()
         self._save_state()
         return True
@@ -231,6 +234,9 @@ class ExperienceAdapter:
         for d in top:
             parts.append(f"[{d.domain}|feedback={d.feedback:+.1f}] {d.content}")
         parts.append("=== END ADAPTATIONS ===")
+        sync_context = self.get_sync_model_context()
+        if sync_context:
+            parts.extend(["", sync_context])
         return "\n".join(parts)
 
     def detect_drift(self) -> Optional[dict]:
@@ -293,10 +299,33 @@ class ExperienceAdapter:
         This trains the local low-rank adapter over persisted experience
         deltas. It does not modify any external provider's private weights.
         """
-        metrics = self._train_low_rank(epochs=epochs)
+        low_rank_metrics = self._train_low_rank(epochs=epochs)
+        sync_pack = self._train_sync_model_adapter(low_rank_metrics, epochs=epochs)
+        metrics = {
+            "low_rank": low_rank_metrics,
+            "sync_model_adapter": sync_pack,
+            # Keep the top-level legacy fields stable for existing API smoke.
+            **low_rank_metrics,
+        }
+        self._last_training_metrics = metrics
         self._save_low_rank()
         self._save_state()
         return metrics
+
+    def get_sync_model_context(self) -> str:
+        """Return the durable sync-model context loaded from disk."""
+        try:
+            from adapters.sync_backend import SyncModelAdapterBackend
+            return SyncModelAdapterBackend(self.adapter_path, self.config, self.base_model_id).load_context()
+        except Exception as e:
+            logger.warning(f"Sync model context load failed: {e}")
+            return ""
+
+    def sync_model_state(self) -> dict:
+        """Return the latest persisted sync-model pack metadata."""
+        if not self._sync_pack:
+            self._load_sync_pack()
+        return dict(self._sync_pack)
 
     def _save_low_rank(self):
         if not hasattr(self, "_low_rank") or self._low_rank is None:
@@ -371,6 +400,36 @@ class ExperienceAdapter:
             self._last_training_metrics = metrics
             return metrics
 
+    def _train_sync_model_adapter(self, low_rank_metrics: dict, epochs: Optional[int] = None) -> dict:
+        if not self.config.get("sync_model_enabled", True):
+            return {"status": "disabled", "trained": False}
+        try:
+            from adapters.sync_backend import SyncModelAdapterBackend
+            backend = SyncModelAdapterBackend(self.adapter_path, self.config, self.base_model_id)
+            self._sync_pack = backend.train(
+                deltas=self._deltas,
+                domain_weights=self._domain_weights,
+                low_rank_metrics=low_rank_metrics,
+                epochs=epochs,
+            )
+            return dict(self._sync_pack)
+        except Exception as e:
+            logger.warning(f"Sync model adapter training failed: {e}")
+            self._sync_pack = {"status": "failed", "trained": False, "reason": str(e)}
+            return dict(self._sync_pack)
+
+    def _load_sync_pack(self):
+        try:
+            from adapters.sync_backend import SyncModelAdapterBackend
+            self._sync_pack = SyncModelAdapterBackend(
+                self.adapter_path,
+                self.config,
+                self.base_model_id,
+            ).load_pack()
+        except Exception as e:
+            logger.warning(f"Sync model pack load failed: {e}")
+            self._sync_pack = {}
+
     def _checkpoint(self):
         ckpt_id = f"ckpt_{self._update_count}_{int(time.time())}"
         ckpt_path = os.path.join(self.adapter_path, f"{ckpt_id}.json")
@@ -407,6 +466,7 @@ class ExperienceAdapter:
                 "delta_count": len(self._deltas),
                 "last_training_metrics": self._last_training_metrics,
                 "last_trained_at": self._last_trained_at,
+                "sync_model_pack": self._sync_pack,
             }, f, indent=2)
 
     def _load_state(self):
@@ -421,6 +481,7 @@ class ExperienceAdapter:
             self._domain_weights = state.get("domain_weights", {})
             self._last_training_metrics = state.get("last_training_metrics", {})
             self._last_trained_at = state.get("last_trained_at")
+            self._sync_pack = state.get("sync_model_pack", {})
         except Exception as e:
             logger.warning(f"Adapter state load failed: {e}")
 
@@ -442,6 +503,7 @@ class ExperienceAdapter:
             "drift_status": self.detect_drift(),
             "last_training_metrics": self._last_training_metrics,
             "last_trained_at": self._last_trained_at,
+            "sync_model_adapter": self.sync_model_state(),
             "embedding_engine": self._get_engine().stats() if self._get_engine() else None,
         }
 

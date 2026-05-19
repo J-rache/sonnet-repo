@@ -49,6 +49,15 @@ adapter_auto_train: true
 adapter_train_min_deltas: 1
 adapter_train_interval: 1
 adapter_seed: "pnp"
+sync_model_enabled: true
+sync_model_adapter_backend: "context_pack"
+# Set sync_model_adapter_backend: "peft_lora" and sync_model_base_model to a
+# local/Hugging Face causal-LM path when a trainable local runtime is available.
+sync_model_base_model: ""
+peft_training_epochs: 1
+peft_batch_size: 1
+peft_max_length: 512
+peft_learning_rate: 0.0002
 
 # API
 api_host: "127.0.0.1"

@@ -60,6 +60,15 @@ Install using any local Ollama model:
 .\install.ps1 -Provider ollama -ModelId qwen2.5-coder:7b
 ```
 
+Install with optional local PEFT/LoRA training dependencies for a trainable
+Hugging Face-style sync model:
+
+```powershell
+.\install.ps1 -Provider ollama -ModelId qwen2.5-coder:7b `
+  -InstallTrainingDeps `
+  -SyncModelBase "C:\path\to\local\hf-causal-lm"
+```
+
 Install without Desktop shortcuts:
 
 ```powershell
@@ -77,6 +86,23 @@ Installed launchers:
 
 The installed config is at `%LOCALAPPDATA%\PNP\config\installed.yaml`. The API
 token is stored there as `local_api_token`; `PNP_LOCAL_TOKEN` can override it.
+
+## Sync Model Adapter
+
+PNP treats the durable brain as journal + memory + adapter state, not as a
+single provider's hidden weights. On every adapter train, it writes:
+
+- `sync_model_pack.json`: model/provider binding, delta counts, low-rank metrics,
+  and optional PEFT LoRA metadata
+- `sync_model_context.md`: compact learned state injected into future inference
+  context
+- `low_rank_adapter.json`: the dependency-free local low-rank adapter weights
+
+For Ollama/GGUF models, the sync model binds through this persisted adapter
+pack and context. For local Hugging Face-style causal-LM runtimes, set
+`sync_model_adapter_backend: peft_lora` plus `sync_model_base_model` and install
+the `train` extras; PNP will train and save a real PEFT LoRA adapter under the
+adapter directory.
 
 ## Run From Source
 
@@ -146,6 +172,7 @@ curl.exe -X POST http://127.0.0.1:8000/adapter/train `
 Protected mutating endpoints include `/chat`, `/goals`, goal progress/deletion,
 manual episodic memory writes, manual consolidation, `/feedback`, and
 `/adapter/train`.
+`GET /adapter/sync` shows the current sync-model pack and context.
 
 ## Verification
 
@@ -186,17 +213,21 @@ Implemented:
 - Adapter deltas persist across restart.
 - Adapter training persists a local low-rank adapter model and exposes
   `/adapter/train`.
+- Adapter training writes a sync-model adapter pack and reloadable sync context
+  that binds prior sessions to whichever model/provider is selected on startup.
+- Optional PEFT/LoRA training is wired for local trainable Hugging Face-style
+  runtimes when training dependencies and a local base model are configured.
 - The supervisor can restart a crashed process and run health checks.
 - `install.ps1` installs PNP as a per-user standalone local app with its own
   venv, installed config, launchers, optional Desktop shortcuts, and smoke
   command.
 
-Current limits:
+Runtime boundaries:
 
-- PNP does not train or modify external provider weights, including Claude,
-  OpenAI-compatible hosted models, or Ollama model files.
-- The local adapter is structured low-rank adapter persistence over local
-  embeddings, not PEFT/gradient training inside a transformer runtime.
+- PNP does not claim access to hidden provider weights. Provider sync happens
+  through the durable sync pack, retrieved memory, and adapter context.
+- PEFT/LoRA weight training is available for local trainable model runtimes, not
+  for runtimes such as Ollama/GGUF that expose inference but not gradients.
 - Local embedding retrieval uses deterministic TF-IDF/LSA style vectors and
   hash fallback, not a transformer embedding model.
 - The supervisor is a process supervisor, not an installed Windows Service.

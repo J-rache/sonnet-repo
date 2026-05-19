@@ -122,6 +122,9 @@ def test_api_smoke_without_live_model_call(monkeypatch, tmp_path):
 
         recent = client.get("/memory/recent").json()
         assert recent["stats"]["total_episodes"] >= 1
+        sync_response = client.get("/adapter/sync")
+        assert sync_response.status_code == 200
+        assert "SYNC MODEL ADAPTER STATE" in sync_response.json()["sync_model_context"]
         assert client.post("/memory/consolidate").status_code == 401
 
     journal_path = tmp_path / "runtime" / "events.jsonl"

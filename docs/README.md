@@ -17,7 +17,12 @@ Implemented behavior:
   retrieval.
 - Adapter deltas are saved to disk and loaded on restart.
 - Adapter feedback trains a persisted local low-rank additive adapter.
+- Adapter training writes a durable sync-model pack plus reloadable sync context
+  that binds prior sessions to the selected model/provider on startup.
+- A PEFT/LoRA backend exists for local trainable Hugging Face-style runtimes
+  when optional training dependencies and a local base model are configured.
 - `/adapter/train` exposes a token-protected manual adapter-training hook.
+- `/adapter/sync` exposes the current sync-model pack and context.
 - Chat context includes working memory, episodic recall, semantic recall, and
   adapter context when those sources have matches.
 - Mock inference can exercise `/chat` without any live provider.
@@ -31,11 +36,12 @@ Implemented behavior:
   source, a dedicated venv, installed config, launchers, dependency install, and
   optional Desktop shortcuts.
 
-Current limits:
+Runtime boundaries:
 
-- External provider weights are not modified.
-- The adapter is local low-rank persistence over local embeddings, not PEFT
-  training against a loaded transformer.
+- Hidden provider weights are not modified. Providers without a local training
+  surface are synchronized through context, memory, and adapter state.
+- PEFT/LoRA weight training requires a local trainable model runtime; Ollama/GGUF
+  inference endpoints do not expose gradients to update model files.
 - Embedding retrieval is deterministic local vector scoring, not transformer
   embedding quality.
 - The supervisor is not installed as a Windows Service.

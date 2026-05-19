@@ -8,6 +8,8 @@ param(
     [switch]$CreateDesktopShortcuts,
     [switch]$NoDesktopShortcuts,
     [switch]$SkipDependencyInstall,
+    [switch]$InstallTrainingDeps,
+    [string]$SyncModelBase = '',
     [switch]$Force
 )
 
@@ -23,12 +25,12 @@ function Resolve-FullPath {
 }
 
 function Quote-Yaml {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    param([AllowEmptyString()][string]$Value)
     return "'" + ($Value -replace "'", "''") + "'"
 }
 
 function Quote-PS {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    param([AllowEmptyString()][string]$Value)
     return "'" + ($Value -replace "'", "''") + "'"
 }
 
@@ -77,7 +79,7 @@ function Copy-AppSource {
     $tracked = @()
     Push-Location $SourceRoot
     try {
-        $tracked = & git ls-files
+        $tracked = & git ls-files --cached --others --exclude-standard
         if ($LASTEXITCODE -ne 0 -or -not $tracked) {
             $tracked = @()
         }
@@ -132,6 +134,7 @@ $VenvPython = Join-Path $VenvRoot 'Scripts\python.exe'
 if (-not $LocalToken) {
     $LocalToken = [guid]::NewGuid().ToString('N')
 }
+$SyncBackend = if ($InstallTrainingDeps) { 'peft_lora' } else { 'context_pack' }
 
 New-Item -ItemType Directory -Force -Path $InstallRoot, $DataRoot, $ConfigRoot, $LogRoot | Out-Null
 Copy-AppSource -SourceRoot $SourceRoot -AppRoot $AppRoot
@@ -179,6 +182,13 @@ adapter_auto_train: true
 adapter_train_min_deltas: 1
 adapter_train_interval: 1
 adapter_seed: 'pnp'
+sync_model_enabled: true
+sync_model_adapter_backend: $(Quote-Yaml $SyncBackend)
+sync_model_base_model: $(Quote-Yaml $SyncModelBase)
+peft_training_epochs: 1
+peft_batch_size: 1
+peft_max_length: 512
+peft_learning_rate: 0.0002
 
 api_host: '127.0.0.1'
 api_port: 8000
@@ -217,6 +227,9 @@ if (-not $SkipDependencyInstall) {
     Invoke-Checked -FilePath $VenvPython -ArgumentList @('-m', 'pip', 'install', '--upgrade', 'pip')
     Invoke-Checked -FilePath $VenvPython -ArgumentList @('-m', 'pip', 'install', '-r', (Join-Path $AppRoot 'requirements.txt'))
     Invoke-Checked -FilePath $VenvPython -ArgumentList @('-m', 'pip', 'install', '-e', $AppRoot)
+    if ($InstallTrainingDeps) {
+        Invoke-Checked -FilePath $VenvPython -ArgumentList @('-m', 'pip', 'install', '-e', "$AppRoot[train]")
+    }
 }
 
 $quotedConfig = Quote-PS $InstalledConfig
@@ -320,6 +333,8 @@ $manifest = [ordered]@{
     venv_python = $VenvPython
     provider = $Provider
     model_id = $ModelId
+    training_dependencies = [bool]$InstallTrainingDeps
+    sync_model_base = $SyncModelBase
     source_root = $SourceRoot
     source_commit = $sourceCommit
     launchers = [ordered]@{

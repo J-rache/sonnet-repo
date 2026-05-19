@@ -140,6 +140,10 @@ def main() -> int:
         result["checks"].append(["GET /adapter/stats", adapter_stats.status_code])
         result["adapter_stats"] = adapter_stats.json()
 
+        adapter_sync = client.get("/adapter/sync")
+        result["checks"].append(["GET /adapter/sync", adapter_sync.status_code])
+        result["adapter_sync"] = adapter_sync.json()
+
         consolidate_blocked = client.post("/memory/consolidate")
         result["checks"].append(["POST /memory/consolidate without token", consolidate_blocked.status_code])
 
